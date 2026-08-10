@@ -100,14 +100,16 @@ def _update_env(values: dict[str, str]) -> None:
 def validate_credentials_payload(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise BootstrapExchangeError("GitHub returned a non-object JSON response")
-    required_text = ("slug", "client_id", "client_secret", "webhook_secret")
-    if not all(isinstance(payload.get(key), str) and payload[key].strip() for key in required_text):
-        raise BootstrapExchangeError("GitHub returned incomplete App credentials")
-    if not isinstance(payload.get("id"), (int, str)) or not str(payload["id"]).strip():
-        raise BootstrapExchangeError("GitHub returned incomplete App credentials")
+    missing: list[str] = []
+    for key in ("id", "slug", "client_id", "client_secret", "webhook_secret"):
+        value = payload.get(key)
+        if not isinstance(value, (int, str)) or not str(value).strip():
+            missing.append(key)
     pem = payload.get("pem")
     if not isinstance(pem, str) or not pem.startswith("-----BEGIN") or "PRIVATE KEY" not in pem:
-        raise BootstrapExchangeError("GitHub did not return a private key")
+        missing.append("pem")
+    if missing:
+        raise BootstrapExchangeError(f"GitHub returned incomplete App credentials (missing: {', '.join(missing)})")
     return payload
 
 

@@ -153,7 +153,7 @@ def test_manifest_code_exchange_rejects_missing_required_field(monkeypatch: pyte
     payload = credential_payload()
     del payload["client_secret"]
     monkeypatch.setattr(bootstrap.httpx, "post", lambda *args, **kwargs: FakeResponse(payload=payload))
-    with pytest.raises(bootstrap.BootstrapExchangeError, match="incomplete"):
+    with pytest.raises(bootstrap.BootstrapExchangeError, match="missing: client_secret"):
         bootstrap.exchange_manifest_code("temporary-code")
 
 
