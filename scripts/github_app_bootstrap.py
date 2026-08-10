@@ -24,20 +24,36 @@ COMPOSE_PEM_PATH = "/run/secrets/github-app.pem"
 GITHUB_MANIFEST_URL = "https://github.com/settings/apps/new"
 
 
-def build_manifest(*, redirect_url: str, app_name: str) -> dict[str, object]:
-    return {
+def _validate_url(value: str, *, field: str, https_only: bool = False) -> None:
+    parsed = urlparse(value)
+    allowed = {"https"} if https_only else {"http", "https"}
+    if parsed.scheme not in allowed or not parsed.netloc or not parsed.hostname:
+        raise ValueError(f"{field} must be an absolute {'HTTPS' if https_only else 'HTTP(S)'} URL")
+
+
+def build_manifest(*, redirect_url: str, app_name: str, webhook_url: str | None = None) -> dict[str, object]:
+    _validate_url(redirect_url, field="redirect_url")
+    callback_url = "http://localhost:8000/api/github/callback"
+    setup_url = "http://localhost:8000/api/github/setup"
+    _validate_url(callback_url, field="callback_urls[0]")
+    _validate_url(setup_url, field="setup_url")
+    manifest: dict[str, object] = {
         "name": app_name,
         "url": "http://localhost:3000",
         "redirect_url": redirect_url,
-        "callback_urls": ["http://localhost:8000/api/github/callback"],
-        "setup_url": "http://localhost:8000/api/github/setup",
+        "callback_urls": [callback_url],
+        "setup_url": setup_url,
         "description": "Development GitHub App for AgentDock publication verification.",
         "public": False,
         "default_permissions": {"metadata": "read", "contents": "write", "pull_requests": "write"},
-        "default_events": ["installation", "installation_repositories"],
         "request_oauth_on_install": True,
         "setup_on_update": False,
     }
+    _validate_url(manifest["url"], field="url")
+    if webhook_url:
+        _validate_url(webhook_url, field="hook_attributes.url", https_only=True)
+        manifest["hook_attributes"] = {"url": webhook_url, "active": True}
+    return manifest
 
 
 def _update_env(values: dict[str, str]) -> None:
@@ -146,6 +162,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Bootstrap an AgentDock development GitHub App")
     parser.add_argument("--no-open", action="store_true", help="print the local start URL instead of opening it")
     parser.add_argument("--name", default="", help="override the generated GitHub App name")
+    parser.add_argument(
+        "--webhook-url",
+        default=os.environ.get("AGENTDOCK_PUBLIC_WEBHOOK_URL", ""),
+        help="optional externally reachable HTTPS webhook URL",
+    )
     args = parser.parse_args()
     if os.environ.get("APP_ENV", "development").lower() not in {"development", "local", "test"}:
         raise SystemExit("Refusing to run outside development/local/test")
@@ -157,6 +178,7 @@ def main() -> int:
         build_manifest(
             redirect_url=f"http://127.0.0.1:{server.server_port}/callback",
             app_name=args.name or f"AgentDock Dev {secrets.token_hex(3)}",
+            webhook_url=args.webhook_url or None,
         ),
         separators=(",", ":"),
     )
