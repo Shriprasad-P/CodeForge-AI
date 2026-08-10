@@ -95,6 +95,12 @@ See [sandbox.md](./sandbox.md) for residual risks (disk quota, worker socket pri
 | Default-branch mutation | Publication always creates a run branch and pushes `branch:branch` |
 | Publication command injection | Git operations use fixed argv; branch/title are normalized and bounded |
 
+The developer GitHub App Manifest bootstrap is CLI-only, guarded to
+development/local/test environments, uses a one-time random state, exchanges
+the temporary code once, and stores the returned PEM in an ignored `0600` file.
+It is not an API credential-generation route and is never part of production
+runtime behavior.
+
 ## Broader threats
 
 | Threat | Mitigation |

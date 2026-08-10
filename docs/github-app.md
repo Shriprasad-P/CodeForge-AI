@@ -89,6 +89,25 @@ Login → /github → Connect GitHub
 
 Unit/integration tests mock GitHub HTTP at the client boundary and generate ephemeral RSA keys. Live App credentials are optional.
 
+## Developer App Manifest bootstrap
+
+For local Phase 7 verification, run:
+
+```bash
+python scripts/github_app_bootstrap.py
+```
+
+This development-only CLI opens GitHub's official App Manifest registration
+page with AgentDock's minimal permissions, receives the one-time localhost
+callback, exchanges the temporary code, and stores credentials in `.env` and
+`.local-secrets/github-app.pem` with restrictive permissions. It never prints
+credential values and refuses to run outside development, local, or test
+environments.
+
+After GitHub confirms registration, install the App using “Only select
+repositories” and choose `agentdock-live-test`. The CLI cannot bypass that
+authorization step.
+
 ## Production considerations
 
 - Use HTTPS callback/webhook/setup URLs.

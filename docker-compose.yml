@@ -46,6 +46,8 @@ services:
       SANDBOX_CHECKOUT_MODE: ${SANDBOX_CHECKOUT_MODE:-fixture}
       LLM_PROVIDER: ${LLM_PROVIDER:-fake}
       LLM_MODEL: ${LLM_MODEL:-fake}
+    volumes:
+      - ./.local-secrets:/run/secrets:ro
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
@@ -83,6 +85,7 @@ services:
     volumes:
       # Control-plane only — never mounted into sandbox containers.
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./.local-secrets:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy

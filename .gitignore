@@ -25,6 +25,7 @@ npm-debug.log*
 .env.local
 *.pem
 !*.pem.example
+.local-secrets/
 
 # IDE / OS
 .DS_Store
