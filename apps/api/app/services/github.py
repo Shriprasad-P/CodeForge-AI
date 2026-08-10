@@ -76,8 +76,9 @@ async def consume_oauth_state(state: str) -> dict[str, str]:
 
 
 def verify_webhook_signature(body: bytes, signature_header: str | None) -> None:
-    require_github_configured()
     cfg = get_settings()
+    if not cfg.github_webhook_configured:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="GitHub webhooks are not configured")
     if not signature_header or not signature_header.startswith("sha256="):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing webhook signature")
     digest = hmac.new(

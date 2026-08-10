@@ -58,13 +58,18 @@ GITHUB_APP_CLIENT_ID=
 GITHUB_APP_CLIENT_SECRET=
 GITHUB_APP_PRIVATE_KEY=        # PEM with \n escapes, or use path below
 GITHUB_APP_PRIVATE_KEY_PATH=   # e.g. ./secrets/github-app.pem
-GITHUB_WEBHOOK_SECRET=
+GITHUB_WEBHOOK_SECRET=       # empty when the App has no public webhook configured
 GITHUB_CALLBACK_URL=http://localhost:8000/api/github/callback
 GITHUB_SETUP_URL=http://localhost:8000/api/github/setup
 GITHUB_FRONTEND_SUCCESS_URL=http://localhost:3000/github
 ```
 
-If these are unset, the API still starts. `/api/github/status` reports `configured: false` and the UI shows “GitHub integration is not configured”.
+If the App credentials are unset, the API still starts. `/api/github/status` reports
+`configured: false` and the UI shows “GitHub integration is not configured”.
+
+Webhook delivery is optional for local App/OAuth use. If no public HTTPS webhook URL
+is supplied to the manifest bootstrap, the App can still be configured for API access;
+webhook verification remains disabled until `GITHUB_WEBHOOK_SECRET` is populated.
 
 ## Connection flow
 

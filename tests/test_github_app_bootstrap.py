@@ -117,6 +117,20 @@ def test_persist_credentials_writes_only_ignored_local_files(tmp_path: Path, mon
     assert os.stat(env_path).st_mode & 0o777 == 0o600
 
 
+def test_persist_credentials_allows_no_webhook_secret_for_api_only_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_path = tmp_path / ".env"
+    secret_dir = tmp_path / ".local-secrets"
+    monkeypatch.setattr(bootstrap, "ENV_PATH", env_path)
+    monkeypatch.setattr(bootstrap, "SECRET_DIR", secret_dir)
+    monkeypatch.setattr(bootstrap, "PEM_PATH", secret_dir / "github-app.pem")
+    payload = credential_payload()
+    del payload["webhook_secret"]
+    assert bootstrap.persist_credentials(payload, require_webhook_secret=False) == "agentdock-dev-test"
+    assert "GITHUB_WEBHOOK_SECRET=" in env_path.read_text()
+
+
 def test_manifest_code_exchange_maps_success_response(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, dict[str, str], int]] = []
 
@@ -132,6 +146,16 @@ def test_manifest_code_exchange_maps_success_response(monkeypatch: pytest.Monkey
     assert calls[0][1]["Accept"] == "application/vnd.github+json"
     assert calls[0][1]["X-GitHub-Api-Version"] == "2022-11-28"
     assert state.exchange_status == 201
+
+
+def test_manifest_code_exchange_allows_missing_webhook_secret_without_webhook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = credential_payload()
+    del payload["webhook_secret"]
+    state = bootstrap._BootstrapState(expected_state="expected", manifest="{}", webhook_configured=False)
+    monkeypatch.setattr(bootstrap.httpx, "post", lambda *args, **kwargs: FakeResponse(payload=payload))
+    assert bootstrap.exchange_manifest_code("temporary-code", state) == payload
 
 
 @pytest.mark.parametrize("status", [400, 422, 500, 503])

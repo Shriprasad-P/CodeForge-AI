@@ -35,6 +35,7 @@ class BootstrapExchangeError(RuntimeError):
 class _BootstrapState:
     expected_state: str
     manifest: str
+    webhook_configured: bool = False
     result: dict[str, object] | None = None
     error: str | None = None
     callback_received: bool = False
@@ -97,11 +98,14 @@ def _update_env(values: dict[str, str]) -> None:
     os.chmod(ENV_PATH, 0o600)
 
 
-def validate_credentials_payload(payload: object) -> dict[str, object]:
+def validate_credentials_payload(payload: object, *, require_webhook_secret: bool = True) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise BootstrapExchangeError("GitHub returned a non-object JSON response")
     missing: list[str] = []
-    for key in ("id", "slug", "client_id", "client_secret", "webhook_secret"):
+    required_keys = ["id", "slug", "client_id", "client_secret"]
+    if require_webhook_secret:
+        required_keys.append("webhook_secret")
+    for key in required_keys:
         value = payload.get(key)
         if not isinstance(value, (int, str)) or not str(value).strip():
             missing.append(key)
@@ -131,7 +135,10 @@ def exchange_manifest_code(code: str, state: _BootstrapState | None = None) -> d
             payload = response.json()
         except (TypeError, ValueError) as exc:
             raise BootstrapExchangeError("GitHub returned malformed JSON") from exc
-        return validate_credentials_payload(payload)
+        return validate_credentials_payload(
+            payload,
+            require_webhook_secret=state is None or state.webhook_configured,
+        )
     except BootstrapExchangeError:
         raise
     except httpx.TimeoutException as exc:
@@ -140,8 +147,8 @@ def exchange_manifest_code(code: str, state: _BootstrapState | None = None) -> d
         raise BootstrapExchangeError("GitHub manifest conversion request failed") from exc
 
 
-def persist_credentials(payload: dict[str, object]) -> str:
-    payload = validate_credentials_payload(payload)
+def persist_credentials(payload: dict[str, object], *, require_webhook_secret: bool = True) -> str:
+    payload = validate_credentials_payload(payload, require_webhook_secret=require_webhook_secret)
     pem = payload["pem"]
     required = {
         "GITHUB_APP_ID": str(payload.get("id", "")),
@@ -153,7 +160,8 @@ def persist_credentials(payload: dict[str, object]) -> str:
         "GITHUB_CALLBACK_URL": "http://localhost:8000/api/github/callback",
         "GITHUB_SETUP_URL": "http://localhost:8000/api/github/setup",
     }
-    if any(not value or value == "None" for value in required.values()):
+    required_persistence_keys = [key for key in required if require_webhook_secret or key != "GITHUB_WEBHOOK_SECRET"]
+    if any(not required[key] or required[key] == "None" for key in required_persistence_keys):
         raise RuntimeError("GitHub returned incomplete App credentials")
     SECRET_DIR.mkdir(mode=0o700, exist_ok=True)
     os.chmod(SECRET_DIR, 0o700)
@@ -242,6 +250,7 @@ def main() -> int:
     redirect_url = f"http://127.0.0.1:{server.server_port}/callback"
     bootstrap = _BootstrapState(
         expected_state=state,
+        webhook_configured=bool(args.webhook_url),
         manifest=json.dumps(
             build_manifest(
                 redirect_url=redirect_url,
@@ -277,7 +286,7 @@ def main() -> int:
     if bootstrap.result is None:
         raise SystemExit("GitHub App registration returned no credentials")
     try:
-        slug = persist_credentials(bootstrap.result)
+        slug = persist_credentials(bootstrap.result, require_webhook_secret=bootstrap.webhook_configured)
     except (OSError, RuntimeError) as exc:
         print("Credential persistence: failed")
         raise SystemExit(f"Credential persistence failed: {type(exc).__name__}") from exc

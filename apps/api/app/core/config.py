@@ -149,8 +149,11 @@ class Settings(BaseSettings):
             and self.github_app_client_id
             and self.github_app_client_secret
             and (self.github_app_private_key or self.github_app_private_key_path)
-            and self.github_webhook_secret
         )
+
+    @property
+    def github_webhook_configured(self) -> bool:
+        return self.github_configured and bool(self.github_webhook_secret)
 
     @property
     def agent_configured(self) -> bool:
