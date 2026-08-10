@@ -168,3 +168,40 @@ class GitHubClient:
             f"{settings.github_api_base_url}/repositories/{repository_id}",
             headers=_headers(installation_token, token_type="Bearer"),
         )
+
+    async def create_pull_request(
+        self,
+        installation_token: str,
+        *,
+        owner: str,
+        repo: str,
+        title: str,
+        body: str,
+        head: str,
+        base: str,
+    ) -> dict[str, Any]:
+        settings = get_settings()
+        return await self._request(
+            "POST",
+            f"{settings.github_api_base_url}/repos/{owner}/{repo}/pulls",
+            headers=_headers(installation_token, token_type="Bearer"),
+            json={"title": title, "body": body, "head": head, "base": base},
+        )
+
+    async def find_pull_request(
+        self,
+        installation_token: str,
+        *,
+        owner: str,
+        repo: str,
+        head: str,
+        base: str,
+    ) -> dict[str, Any] | None:
+        settings = get_settings()
+        rows = await self._request(
+            "GET",
+            f"{settings.github_api_base_url}/repos/{owner}/{repo}/pulls",
+            headers=_headers(installation_token, token_type="Bearer"),
+            params={"state": "open", "head": f"{owner}:{head}", "base": base, "per_page": 100},
+        )
+        return next((row for row in rows if row.get("head", {}).get("ref") == head), None)

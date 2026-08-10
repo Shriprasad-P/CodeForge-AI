@@ -162,6 +162,14 @@ Bounded stdout/stderr (`output_truncated` when clipped).
 
 ### `POST /api/agent-runs/{id}/cancel` → **200** / **409**
 
+### `POST /api/agent-runs/{id}/approve` → **200** / **404** / **409**
+
+Owner-only approval of the persisted validated diff. Queues trusted publication.
+
+### `POST /api/agent-runs/{id}/reject` → **200** / **404** / **409**
+
+Owner-only terminal rejection while the run awaits approval.
+
 ## Realtime WebSocket (Phase 6)
 
 ### `WS /ws/agent-runs/{run_id}`
@@ -176,4 +184,4 @@ See [realtime.md](./realtime.md) for event schema, close codes, proxy notes.
 
 ## Later phases
 
-Approval/PR generation, browser tools.
+Browser tools. See [publication.md](./publication.md) for Phase 7 commit/push/PR behavior.

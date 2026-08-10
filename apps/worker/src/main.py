@@ -19,6 +19,7 @@ from app.services.queue import dequeue_work
 from sandbox_sdk.docker_provider import DockerSandboxProvider
 
 from src.agent.loop import process_agent_run
+from src.publication import process_publication
 from src.processor import process_job, reconcile_stale_jobs
 
 configure_logging()
@@ -49,6 +50,10 @@ async def worker_loop() -> None:
         async with sem:
             await process_agent_run(run_id, provider)
 
+    async def _run_publication(run_id) -> None:
+        async with sem:
+            await process_publication(run_id, provider)
+
     try:
         while True:
             item = await dequeue_work(timeout_seconds=5)
@@ -58,6 +63,8 @@ async def worker_loop() -> None:
             kind, work_id = item
             if kind == "agent":
                 task = asyncio.create_task(_run_agent(work_id))
+            elif kind == "publication":
+                task = asyncio.create_task(_run_publication(work_id))
             else:
                 task = asyncio.create_task(_run_execution(work_id))
             tasks.add(task)

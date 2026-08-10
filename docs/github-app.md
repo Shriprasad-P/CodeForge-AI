@@ -15,7 +15,7 @@ AgentDock uses a **GitHub App** (not a long-lived personal access token) for ins
 3. Generate a private key (`.pem`). Store it outside git, or paste into `GITHUB_APP_PRIVATE_KEY` with `\n` newlines.
 4. Copy App ID, Client ID, Client Secret, and App slug into `.env`.
 
-## Permissions (Phase 3 minimum)
+## Permissions
 
 Repository permissions:
 
@@ -23,13 +23,20 @@ Repository permissions:
 |------------|--------|-----|
 | **Metadata** | Read-only | List installation repositories and read safe repo metadata |
 
-Do **not** request for Phase 3:
+Phase 3 minimum:
 
-- Contents: write
-- Pull requests: write
+ - Metadata: read-only
+
+Phase 7 publication additionally requires:
+
+ - Contents: read and write — clone the default branch and push the run branch
+ - Pull requests: read and write — discover or create the pull request
+
+Do **not** request:
+
 - Administration: write
 
-Later phases can expand permissions deliberately when cloning, editing, or opening PRs is implemented.
+The worker uses short-lived installation tokens and never exposes them to the browser or agent sandbox.
 
 Account permissions: none required beyond the App’s user-to-server OAuth for identity linking.
 

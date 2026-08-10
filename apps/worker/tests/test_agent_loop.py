@@ -121,7 +121,10 @@ async def test_deterministic_agent_e2e(image_ready: str, monkeypatch: pytest.Mon
     async with factory() as session:
         finished = await session.get(AgentRun, run_id)
         assert finished is not None
-        assert finished.status == AgentRunStatus.succeeded
+        assert finished.status == AgentRunStatus.awaiting_approval
+        assert finished.approval_status == "pending"
+        assert finished.base_commit_sha
+        assert finished.diff_hash
         assert finished.validation and finished.validation.get("ok") is True
         assert finished.changed_files
         assert finished.diff_text is not None
@@ -214,7 +217,7 @@ async def test_agent_publishes_lifecycle_events(image_ready: str, monkeypatch: p
             if message and message.get("type") == "message":
                 payload = json.loads(message["data"])
                 events.append(payload["event"])
-                if payload["event"] in {"agent.run.completed", "agent.run.failed"}:
+                if payload["event"] in {"agent.approval.required", "agent.run.failed"}:
                     return
             await asyncio.sleep(0.05)
 
@@ -231,7 +234,7 @@ async def test_agent_publishes_lifecycle_events(image_ready: str, monkeypatch: p
     assert "agent.validation.started" in events
     assert "agent.validation.completed" in events
     assert "agent.diff.ready" in events
-    assert "agent.run.completed" in events
+    assert "agent.approval.required" in events
     # sequences increase — spot check via republish not needed
     await pubsub.aclose()
     await sub.aclose()
@@ -321,7 +324,7 @@ async def test_agent_publishes_lifecycle_events(image_ready: str, monkeypatch: p
         assert "sk-test-should-never-appear" not in blob
         assert "should-never-appear" not in blob
         assert "AGENTDOCK_SANDBOX" in blob or finished.status in {
-            AgentRunStatus.succeeded,
+            AgentRunStatus.awaiting_approval,
             AgentRunStatus.failed,
         }
     await close_redis()

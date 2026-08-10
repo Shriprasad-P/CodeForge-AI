@@ -54,3 +54,12 @@
 - [x] Frontend live activity / XSS-safe output / reconnect / cancel
 - [x] Docs: `docs/realtime.md`
 - [ ] Optional multi-replica WS soak (Compose remains single API)
+
+## Phase 7
+
+- [x] Owner-only approval, rejection, duplicate approval, and cancellation boundary
+- [x] SHA-256 diff and base-commit integrity checks
+- [x] Deterministic local Git commit and push to a bare remote
+- [x] Mocked PR creation and duplicate-delivery idempotency
+- [x] Publication event protocol and frontend approval controls
+- [ ] Live GitHub App installation and PR creation (requires repository credentials)

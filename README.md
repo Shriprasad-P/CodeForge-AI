@@ -4,7 +4,7 @@
 
 Secure cloud coding-agent platform. Users connect a GitHub App, pick a repository, describe a task, and an AI agent works inside an isolated sandbox — then opens a pull request after approval.
 
-> Phase 6 status: Phase 1–5 preserved + authenticated WebSocket agent workspace streaming.
+> Phase 7 status: Phase 1–6 preserved + owner-approved, integrity-checked Git publication.
 
 ![AgentDock status panel](docs/assets/screenshot-placeholder.svg)
 
@@ -167,7 +167,7 @@ Working: execution jobs, worker queue, Docker sandbox isolation, fixture checkou
 
 Working: agent runs/steps, FakeLLM deterministic loop, OpenAI provider hook, tool security, `/agent` UI.
 
-Not yet: git commit/push, PR creation, approval flow, WebSocket workspace, browser automation.
+Working: approval-gated commit/push/PR publication and the Phase 6 WebSocket workspace.
 
 ## Phase roadmap
 
@@ -179,7 +179,7 @@ Not yet: git commit/push, PR creation, approval flow, WebSocket workspace, brows
 | 4 | Secure sandbox runtime + worker execution |
 | 5 | Coding agent state machine + tools |
 | 6 | WebSocket workspace UI |
-| 7 | Diff, approval, PR |
+| 7 | Diff, approval, trusted commit/push, PR |
 | 8 | Playwright browser tools |
 | 9 | Observability + E2E |
 

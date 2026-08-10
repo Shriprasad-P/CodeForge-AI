@@ -242,6 +242,18 @@ export type ExecutionJob = {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+  approval_status: string;
+  approved_at: string | null;
+  rejected_at: string | null;
+  rejection_reason: string | null;
+  base_commit_sha: string | null;
+  diff_hash: string | null;
+  publication_status: string;
+  branch_name: string | null;
+  commit_sha: string | null;
+  github_pr_number: number | null;
+  github_pr_id: number | null;
+  github_pr_url: string | null;
 };
 
 export type ExecutionLogs = {
@@ -312,6 +324,18 @@ export type AgentRun = {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+  approval_status: string;
+  approved_at: string | null;
+  rejected_at: string | null;
+  rejection_reason: string | null;
+  base_commit_sha: string | null;
+  diff_hash: string | null;
+  publication_status: string;
+  branch_name: string | null;
+  commit_sha: string | null;
+  github_pr_number: number | null;
+  github_pr_id: number | null;
+  github_pr_url: string | null;
 };
 
 export type AgentStep = {
@@ -332,6 +356,8 @@ export type AgentDiff = {
   diff_text: string;
   diff_truncated: boolean;
   changed_files: { path?: string; change_type?: string }[];
+  diff_hash: string | null;
+  base_commit_sha: string | null;
 };
 
 export async function fetchAgentStatus(): Promise<AgentStatus> {
@@ -367,4 +393,12 @@ export async function fetchAgentDiff(id: string): Promise<AgentDiff> {
 
 export async function cancelAgentRun(id: string): Promise<AgentRun> {
   return apiFetch<AgentRun>(`/api/agent-runs/${id}/cancel`, { method: "POST" });
+}
+
+export async function approveAgentRun(id: string): Promise<AgentRun> {
+  return apiFetch<AgentRun>(`/api/agent-runs/${id}/approve`, { method: "POST" });
+}
+
+export async function rejectAgentRun(id: string): Promise<AgentRun> {
+  return apiFetch<AgentRun>(`/api/agent-runs/${id}/reject`, { method: "POST" });
 }

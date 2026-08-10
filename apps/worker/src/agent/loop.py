@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -219,6 +220,11 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                 subprocess.run(["git", "config", "user.name", "AgentDock"], cwd=repo_path, check=True)
                 subprocess.run(["git", "add", "-A"], cwd=repo_path, check=True, capture_output=True)
                 subprocess.run(["git", "commit", "-m", "base"], cwd=repo_path, check=True, capture_output=True)
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo_path, check=True, capture_output=True, text=True
+            ).stdout.strip()
+            run.base_commit_sha = base_sha
+            await db.commit()
 
             sandbox_id = provider.create(
                 SandboxSpec(
@@ -396,12 +402,13 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                         ok = True
                         result_status = "succeeded"
                         err_type = None
-                        final_status = AgentRunStatus.succeeded
+                        final_status = AgentRunStatus.awaiting_approval
                         if last_validation and not last_validation.get("ok"):
                             ok = False
                             result_status = "failed_validation"
                             err_type = AgentRunErrorType.failed_validation
                             final_status = AgentRunStatus.failed
+                        diff_hash = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
                         await finish_agent_run(
                             db,
                             run,
@@ -416,15 +423,27 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                             diff_text=diff_text,
                             diff_truncated=truncated,
                         )
+                        fresh_after_finish = await db.get(AgentRun, run.id)
+                        if fresh_after_finish is not None:
+                            fresh_after_finish.diff_hash = diff_hash
+                            fresh_after_finish.publication_status = "pending"
+                            await db.commit()
                         await events.publish("agent.files.changed", {"files": changed})
                         await events.publish(
                             "agent.diff.ready",
                             {"truncated": truncated, "stat_preview": (diff_stat.summary or "")[:500]},
                         )
-                        await events.publish(
-                            _terminal_event(final_status),
-                            {"status": final_status.value, "result_status": result_status},
-                        )
+                        await events.publish("agent.run.status", {"status": final_status.value})
+                        if final_status == AgentRunStatus.awaiting_approval:
+                            await events.publish(
+                                "agent.approval.required",
+                                {"status": final_status.value, "diff_hash": diff_hash},
+                            )
+                        else:
+                            await events.publish(
+                                _terminal_event(final_status),
+                                {"status": final_status.value, "result_status": result_status},
+                            )
                         logger.info(
                             "agent.run.succeeded" if ok else "agent.run.failed",
                             agent_run_id=str(run.id),

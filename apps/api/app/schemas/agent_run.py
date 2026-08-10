@@ -43,6 +43,18 @@ class AgentRunResponse(BaseModel):
     finished_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    approval_status: str
+    approved_at: datetime | None
+    rejected_at: datetime | None
+    rejection_reason: str | None
+    base_commit_sha: str | None
+    diff_hash: str | None
+    publication_status: str
+    branch_name: str | None
+    commit_sha: str | None
+    github_pr_number: int | None
+    github_pr_id: int | None
+    github_pr_url: str | None
 
 
 class AgentStepResponse(BaseModel):
@@ -63,6 +75,8 @@ class AgentDiffResponse(BaseModel):
     diff_text: str
     diff_truncated: bool
     changed_files: list
+    diff_hash: str | None
+    base_commit_sha: str | None
 
 
 class AgentStatusResponse(BaseModel):

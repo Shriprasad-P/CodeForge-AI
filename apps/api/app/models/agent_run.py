@@ -16,6 +16,9 @@ class AgentRunStatus(str, enum.Enum):
     planning = "planning"
     running = "running"
     validating = "validating"
+    awaiting_approval = "awaiting_approval"
+    publishing = "publishing"
+    rejected = "rejected"
     succeeded = "succeeded"
     failed = "failed"
     cancelled = "cancelled"
@@ -35,6 +38,9 @@ class AgentRunErrorType(str, enum.Enum):
     cancelled = "cancelled"
     failed_validation = "failed_validation"
     not_configured = "not_configured"
+    publication_failed = "publication_failed"
+    repository_changed = "repository_changed"
+    approval_invalidated = "approval_invalidated"
 
 
 AGENT_TERMINAL = frozenset(
@@ -44,6 +50,7 @@ AGENT_TERMINAL = frozenset(
         AgentRunStatus.cancelled,
         AgentRunStatus.timed_out,
         AgentRunStatus.step_limit_reached,
+        AgentRunStatus.rejected,
     }
 )
 
@@ -101,6 +108,21 @@ class AgentRun(Base, TimestampMixin):
     error_message: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approval_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    approved_by_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    base_commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    diff_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    publication_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    branch_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    github_pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    github_pr_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    github_pr_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
 
 class AgentStep(Base, TimestampMixin):

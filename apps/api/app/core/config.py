@@ -118,6 +118,12 @@ class Settings(BaseSettings):
     ws_max_connections_per_run: int = 5
     ws_command_chunk_chars: int = 512
 
+    # Phase 7 publication. The test remote is only honored in local/test mode.
+    git_author_name: str = "AgentDock"
+    git_author_email: str = "agentdock@users.noreply.github.com"
+    publication_test_remote_url: str = ""
+    publication_mock_prs: bool = False
+
     @cached_property
     def cors_origin_list(self) -> list[str]:
         text = self.cors_origins.strip()

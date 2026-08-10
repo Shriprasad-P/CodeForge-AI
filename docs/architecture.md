@@ -27,7 +27,7 @@ API (FastAPI) ──► PostgreSQL
 | 4 | Secure sandbox runtime + worker execution |
 | 5 | Coding agent state machine + tools |
 | 6 | WebSocket workspace UI |
-| 7 | Diff, approval, PR |
+| 7 | Diff, approval, trusted commit/push, PR |
 | 8 | Playwright browser tools |
 | 9 | Observability hardening + E2E |
 

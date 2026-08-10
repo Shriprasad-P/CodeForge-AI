@@ -7,6 +7,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   ApiError,
+  approveAgentRun,
   createAgentRun,
   cancelAgentRun,
   fetchAgentDiff,
@@ -14,14 +15,15 @@ import {
   fetchAgentStatus,
   fetchAgentSteps,
   fetchGitHubConnections,
+  rejectAgentRun,
   type AgentRun,
   type RepositoryConnection,
 } from "@/lib/api";
 import { useMe } from "@/lib/auth";
 import { useAgentRunSocket } from "@/lib/use-agent-run-socket";
 
-function statusLabel(status: string): string {
-  return status
+function statusLabel(status: string | undefined): string {
+  return (status || "unknown")
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
@@ -93,7 +95,7 @@ export function AgentPanel() {
       const rows = query.state.data as AgentRun[] | undefined;
       if (!rows) return false;
       const active = rows.some((row) =>
-        ["queued", "planning", "running", "validating"].includes(row.status),
+        ["queued", "planning", "running", "validating", "publishing"].includes(row.status),
       );
       if (!active) return false;
       // WebSocket primary; poll when disconnected / reconnecting.
@@ -146,6 +148,22 @@ export function AgentPanel() {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["agent-runs"] });
     },
+  });
+
+  const approve = useMutation({
+    mutationFn: approveAgentRun,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["agent-runs"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : "Unable to approve publication"),
+  });
+
+  const reject = useMutation({
+    mutationFn: rejectAgentRun,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["agent-runs"] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : "Unable to reject publication"),
   });
 
   const selected = useMemo(
@@ -294,6 +312,41 @@ export function AgentPanel() {
               </button>
             ) : null}
           </div>
+          {selected.status === "awaiting_approval" && (selected.publication_status || "pending") === "pending" ? (
+            <div className="rounded-lg border border-accent/50 bg-accent/10 p-4">
+              <p className="font-semibold">Human approval required</p>
+              <p className="mt-1 text-sm text-muted">
+                Review the exact diff and validation result below. Approval will create a branch, commit, push it, and open a pull request.
+              </p>
+              <div className="mt-3 flex gap-2">
+                <button
+                  type="button"
+                  disabled={approve.isPending || reject.isPending || !diff.data?.diff_hash}
+                  onClick={() => approve.mutate(selected.id)}
+                  className="rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-background disabled:opacity-50"
+                >
+                  {approve.isPending ? "Approving…" : "Approve & Create PR"}
+                </button>
+                <button
+                  type="button"
+                  disabled={approve.isPending || reject.isPending}
+                  onClick={() => reject.mutate(selected.id)}
+                  className="rounded-lg border border-border px-3 py-1.5 text-sm font-semibold disabled:opacity-50"
+                >
+                  {reject.isPending ? "Rejecting…" : "Reject"}
+                </button>
+              </div>
+              <p className="mt-2 text-xs text-muted">
+                Base branch: {selected.base_commit_sha ? selected.base_commit_sha.slice(0, 12) : "unknown"} · Changed files: {files.length}
+              </p>
+            </div>
+          ) : null}
+          {(selected.publication_status || "pending") !== "pending" ? (
+            <p className="rounded-lg border border-border p-3 text-sm">
+              Publication: {statusLabel(selected.publication_status || "pending")}
+              {selected.github_pr_url ? <>{" · "}<a className="text-accent underline" href={selected.github_pr_url} target="_blank" rel="noreferrer">Open pull request</a></> : null}
+            </p>
+          ) : null}
           {selected.summary ? <p className="text-sm">{selected.summary}</p> : null}
           {selected.error_message ? <p className="text-sm text-bad">{selected.error_message}</p> : null}
 

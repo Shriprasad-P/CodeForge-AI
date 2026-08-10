@@ -76,6 +76,8 @@ Clients must ignore unsupported `version` values without crashing.
 | `agent.validation.started` / `completed` | Validation |
 | `agent.files.changed` | Filename list |
 | `agent.diff.ready` | Notification — fetch diff via REST |
+| `agent.approval.required` / `agent.approved` / `agent.rejected` | Human approval boundary |
+| `publication.started` / `validation.*` / `commit.created` / `branch.pushed` / `pr.created` / `failed` | Trusted publication progress |
 | `agent.run.completed` / `failed` / `cancelled` / `timed_out` / `step_limit_reached` | Terminal |
 | `agent.ping` / `agent.pong` | Heartbeat (~25s) |
 
@@ -153,7 +155,9 @@ Logs: `websocket.connected`, `websocket.disconnected`, `websocket.unauthorized`,
 
 ## Database
 
-**No migration required for Phase 6.** Existing `agent_runs` + `agent_steps` are sufficient.
+Phase 7 approval and publication state is recoverable from the REST run endpoint
+after a browser disconnect. The publication fields are persisted by migration
+0005; Postgres remains authoritative.
 
 ## Protocol evolution
 

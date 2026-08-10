@@ -161,6 +161,26 @@ export function useAgentRunSocket({
           pushActivity("Diff ready", raw.timestamp);
           onDiffReadyRef.current?.();
           break;
+        case "agent.approval.required":
+          pushActivity("Awaiting human approval", raw.timestamp);
+          onStatusHintRef.current?.("awaiting_approval");
+          break;
+        case "agent.approved":
+          pushActivity("Publication approved", raw.timestamp);
+          break;
+        case "agent.rejected":
+          pushActivity("Publication rejected", raw.timestamp);
+          break;
+        case "publication.started":
+        case "publication.validation.started":
+        case "publication.validation.completed":
+        case "publication.commit.created":
+        case "publication.branch.pushed":
+        case "publication.pr.created":
+        case "publication.failed":
+          pushActivity(statusLabel(raw.event.replace("publication.", "")), raw.timestamp);
+          onNeedRestSyncRef.current?.();
+          break;
         default:
           break;
       }

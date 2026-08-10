@@ -49,6 +49,16 @@ KNOWN_EVENTS = frozenset(
         "agent.run.completed",
         "agent.run.timed_out",
         "agent.run.step_limit_reached",
+        "agent.approval.required",
+        "agent.approved",
+        "agent.rejected",
+        "publication.started",
+        "publication.validation.started",
+        "publication.validation.completed",
+        "publication.commit.created",
+        "publication.branch.pushed",
+        "publication.pr.created",
+        "publication.failed",
     }
 )
 

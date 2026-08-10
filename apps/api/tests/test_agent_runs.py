@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from uuid import uuid4
 
 import pytest
@@ -7,6 +8,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from app.db.session import get_session_factory
+from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.github import GitHubInstallation, RepositoryConnection
 from app.models.user import User
 
@@ -113,3 +115,65 @@ async def test_agent_rejects_empty_task(app_client: AsyncClient) -> None:
         json={"repository_connection_id": connection_id, "task": "   "},
     )
     assert bad.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_agent_approval_is_owner_bound_and_idempotent(app_client: AsyncClient) -> None:
+    email_a = f"approve-a-{uuid4().hex[:8]}@example.com"
+    email_b = f"approve-b-{uuid4().hex[:8]}@example.com"
+    await _register(app_client, email_a)
+    connection_id = await _seed_connection(email_a)
+    created = await app_client.post(
+        "/api/agent-runs",
+        json={"repository_connection_id": connection_id, "task": "Prepare a safe patch."},
+    )
+    run_id = created.json()["id"]
+    diff = "diff --git a/README.md b/README.md\n"
+    factory = get_session_factory()
+    async with factory() as session:
+        run = await session.get(AgentRun, run_id)
+        assert run is not None
+        run.status = AgentRunStatus.awaiting_approval
+        run.diff_text = diff
+        run.diff_hash = hashlib.sha256(diff.encode()).hexdigest()
+        run.base_commit_sha = "a" * 40
+        await session.commit()
+
+    await app_client.post("/api/auth/logout")
+    await _register(app_client, email_b)
+    assert (await app_client.post(f"/api/agent-runs/{run_id}/approve")).status_code == 404
+
+    await app_client.post("/api/auth/logout")
+    await app_client.post("/api/auth/login", json={"email": email_a, "password": "password123"})
+    approved = await app_client.post(f"/api/agent-runs/{run_id}/approve")
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["approval_status"] == "approved"
+    assert approved.json()["publication_status"] == "approved"
+    duplicate = await app_client.post(f"/api/agent-runs/{run_id}/approve")
+    assert duplicate.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_agent_reject_is_terminal_and_cannot_cancel(app_client: AsyncClient) -> None:
+    email = f"reject-{uuid4().hex[:8]}@example.com"
+    await _register(app_client, email)
+    connection_id = await _seed_connection(email)
+    created = await app_client.post(
+        "/api/agent-runs",
+        json={"repository_connection_id": connection_id, "task": "Prepare a patch."},
+    )
+    run_id = created.json()["id"]
+    factory = get_session_factory()
+    async with factory() as session:
+        run = await session.get(AgentRun, run_id)
+        assert run is not None
+        run.status = AgentRunStatus.awaiting_approval
+        run.diff_text = "patch"
+        run.diff_hash = hashlib.sha256(b"patch").hexdigest()
+        await session.commit()
+
+    rejected = await app_client.post(f"/api/agent-runs/{run_id}/reject")
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    assert rejected.json()["publication_status"] == "rejected"
+    assert (await app_client.post(f"/api/agent-runs/{run_id}/cancel")).status_code == 409

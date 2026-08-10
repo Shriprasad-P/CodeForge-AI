@@ -83,6 +83,18 @@ See [sandbox.md](./sandbox.md) for residual risks (disk quota, worker socket pri
 | Connection abuse | Per-user / per-run socket caps |
 | Slow client blocking worker | Redis decouples; bounded outbound queues; drop ephemeral chunks |
 
+## Phase 7 publication mitigations
+
+| Threat | Mitigation |
+|--------|------------|
+| Unauthorized publication | Owner-scoped approval endpoint; atomic pending-to-approved transition |
+| Diff substitution | SHA-256 fingerprint persisted with the run and checked before and after apply |
+| Stale repository base | Exact recorded HEAD required; no automatic rebase |
+| Duplicate commit/PR | Deterministic branch; durable commit/PR state; existing PR lookup on retry |
+| Credential exposure | Short-lived installation token stays in trusted worker; remote URL sanitized; never copied to sandbox |
+| Default-branch mutation | Publication always creates a run branch and pushes `branch:branch` |
+| Publication command injection | Git operations use fixed argv; branch/title are normalized and bounded |
+
 ## Broader threats
 
 | Threat | Mitigation |

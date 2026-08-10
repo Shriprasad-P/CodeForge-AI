@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -20,7 +20,7 @@ from app.models.agent_run import (
 from app.models.agent_session import AgentSession
 from app.models.github import GitHubInstallation, RepositoryConnection
 from app.models.user import User
-from app.services.queue import enqueue_agent_run
+from app.services.queue import enqueue_agent_run, enqueue_publication
 
 logger = get_logger(__name__)
 
@@ -136,7 +136,10 @@ async def request_cancel(db: AsyncSession, *, user_id: UUID, run_id: UUID) -> Ag
         except Exception:
             pass
         return run
-    if run.status in AGENT_TERMINAL:
+    if run.status in AGENT_TERMINAL or run.status in {
+        AgentRunStatus.awaiting_approval,
+        AgentRunStatus.publishing,
+    }:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent run already finished")
     run.cancel_requested = True
     await db.commit()
@@ -148,4 +151,59 @@ async def request_cancel(db: AsyncSession, *, user_id: UUID, run_id: UUID) -> Ag
         await publish_agent_event(run.id, "agent.run.status", {"status": run.status.value, "cancel_requested": True})
     except Exception:
         pass
+    return run
+
+
+async def approve_agent_run(db: AsyncSession, *, user_id: UUID, run_id: UUID) -> AgentRun:
+    """Atomically authorize exactly one persisted, validated diff for publication."""
+    run = await get_user_run(db, user_id=user_id, run_id=run_id)
+    if run.status != AgentRunStatus.awaiting_approval or not run.diff_text or not run.diff_hash:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not awaiting approval")
+    if run.approval_status != "pending" or run.publication_status != "pending":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run approval is no longer available")
+    connection = await db.scalar(
+        select(RepositoryConnection).where(
+            RepositoryConnection.id == run.repository_connection_id,
+            RepositoryConnection.user_id == user_id,
+            RepositoryConnection.is_active.is_(True),
+        )
+    )
+    if connection is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Repository connection is no longer valid")
+    now = datetime.now(timezone.utc)
+    changed = await db.execute(
+        update(AgentRun)
+        .where(
+            AgentRun.id == run_id,
+            AgentRun.user_id == user_id,
+            AgentRun.status == AgentRunStatus.awaiting_approval,
+            AgentRun.approval_status == "pending",
+            AgentRun.publication_status == "pending",
+        )
+        .values(approval_status="approved", approved_by_user_id=user_id, approved_at=now, publication_status="approved")
+    )
+    if changed.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run approval is already being processed")
+    await db.commit()
+    await enqueue_publication(run_id)
+    from app.services.agent_events import publish_agent_event
+
+    await publish_agent_event(run_id, "agent.approved", {"publication_status": "approved"})
+    return await get_user_run(db, user_id=user_id, run_id=run_id)
+
+
+async def reject_agent_run(db: AsyncSession, *, user_id: UUID, run_id: UUID) -> AgentRun:
+    run = await get_user_run(db, user_id=user_id, run_id=run_id)
+    if run.status != AgentRunStatus.awaiting_approval or run.approval_status != "pending":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not awaiting approval")
+    run.approval_status = "rejected"
+    run.publication_status = "rejected"
+    run.status = AgentRunStatus.rejected
+    run.rejected_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(run)
+    from app.services.agent_events import publish_agent_event
+
+    await publish_agent_event(run_id, "agent.rejected", {"publication_status": "rejected"})
     return run
