@@ -11,6 +11,35 @@ jobs:
     defaults:
       run:
         working-directory: apps/api
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agentdock
+          POSTGRES_PASSWORD: agentdock_dev_password
+          POSTGRES_DB: agentdock
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentdock -d agentdock"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://agentdock:agentdock_dev_password@localhost:5432/agentdock
+      REDIS_URL: redis://localhost:6379/0
+      APP_ENV: test
+      SESSION_SECRET: ci-test-session-secret
+      SANDBOX_CHECKOUT_MODE: fixture
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,6 +47,63 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: pip install -r requirements.txt
+      - name: Migrate
+        run: alembic upgrade head
+      - name: Test
+        run: pytest -q
+
+  worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/worker
+    env:
+      APP_ENV: test
+      SANDBOX_IMAGE: agentdock-sandbox:local
+      SANDBOX_CHECKOUT_MODE: fixture
+      LLM_PROVIDER: fake
+      LLM_MODEL: fake
+      DATABASE_URL: postgresql+asyncpg://agentdock:agentdock_dev_password@localhost:5432/agentdock
+      REDIS_URL: redis://localhost:6379/0
+      SESSION_SECRET: ci-test-session-secret
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agentdock
+          POSTGRES_PASSWORD: agentdock_dev_password
+          POSTGRES_DB: agentdock
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentdock -d agentdock"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install -r ../api/requirements.txt
+          pip install -r requirements.txt
+          pip install -e ../../packages/sandbox-sdk
+      - name: Migrate
+        working-directory: apps/api
+        run: alembic upgrade head
+      - name: Build sandbox image
+        run: docker build -t agentdock-sandbox:local -f ../../infrastructure/sandbox/Dockerfile ../../infrastructure/sandbox
       - name: Test
         run: pytest -q
 
@@ -37,6 +123,8 @@ jobs:
         run: npm ci
       - name: Test
         run: npm test
+      - name: Lint
+        run: npm run lint
       - name: Build
         run: npm run build
         env:

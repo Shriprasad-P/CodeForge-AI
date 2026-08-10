@@ -65,6 +65,20 @@ async def test_ready_503_when_postgres_down(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_ready_503_when_redis_down(client: AsyncClient) -> None:
+    with (
+        patch("app.api.health.check_db", new=AsyncMock(return_value=True)),
+        patch("app.api.health.check_redis", new=AsyncMock(return_value=False)),
+    ):
+        response = await client.get("/api/ready")
+    assert response.status_code == 503
+    body = response.json()
+    assert body["status"] == "not_ready"
+    assert body["checks"]["redis"] is False
+    assert body["checks"]["postgres"] is True
+
+
+@pytest.mark.asyncio
 async def test_metrics_prometheus_format(client: AsyncClient) -> None:
     with (
         patch("app.api.health.check_db", new=AsyncMock(return_value=True)),

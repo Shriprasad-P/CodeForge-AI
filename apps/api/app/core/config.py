@@ -6,13 +6,25 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_ROOT_ENV = Path(__file__).resolve().parents[4] / ".env"
-_LOCAL_ENV = Path(__file__).resolve().parents[3] / ".env"
+_HERE = Path(__file__).resolve()
+
+
+def _env_files() -> tuple[str, ...]:
+    """Resolve .env paths for local monorepo and Docker (/app) layouts."""
+    candidates: list[Path] = []
+    # Monorepo checkout: apps/api/app/core/config.py → repo root and apps/api
+    if len(_HERE.parents) > 4:
+        candidates.append(_HERE.parents[4] / ".env")
+    if len(_HERE.parents) > 2:
+        candidates.append(_HERE.parents[2] / ".env")
+    candidates.append(Path(".env"))
+    # Preserve order; pydantic-settings ignores missing files.
+    return tuple(str(path) for path in candidates)
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=(str(_ROOT_ENV), str(_LOCAL_ENV), ".env"),
+        env_file=_env_files(),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -28,11 +40,83 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
 
     database_url: str = (
-        "postgresql+asyncpg://agentdock:agentdock_dev_password@localhost:5432/agentdock"
+        "postgresql+asyncpg://agentdock:agentdock_dev_password@localhost:5433/agentdock"
     )
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://localhost:6380/0"
 
     ready_timeout_seconds: float = 2.0
+
+    # Auth (Phase 2) — SESSION_SECRET is only for future signed payloads; sessions use hashed tokens.
+    session_secret: str = "dev-only-change-me-agentdock-session-secret"
+    session_ttl_seconds: int = 60 * 60 * 24 * 7
+    session_cookie_name: str = "agentdock_session"
+    cookie_secure: bool | None = None  # None → Secure when app_env != development
+    cookie_samesite: str = "lax"
+    cookie_domain: str | None = None
+    auth_rate_limit_attempts: int = 20
+    auth_rate_limit_window_seconds: int = 60
+
+    # GitHub App (Phase 3) — leave empty for local runs without GitHub configured.
+    github_app_id: str = ""
+    github_app_slug: str = "agentdock"
+    github_app_client_id: str = ""
+    github_app_client_secret: str = ""
+    github_app_private_key: str = ""
+    github_app_private_key_path: str = ""
+    github_webhook_secret: str = ""
+    github_callback_url: str = "http://localhost:8000/api/github/callback"
+    github_setup_url: str = "http://localhost:8000/api/github/setup"
+    github_frontend_success_url: str = "http://localhost:3000/github"
+    github_api_base_url: str = "https://api.github.com"
+    github_oauth_base_url: str = "https://github.com"
+    github_oauth_state_ttl_seconds: int = 600
+    github_http_timeout_seconds: float = 15.0
+
+    # Sandbox / executions (Phase 4)
+    sandbox_provider: str = "docker"
+    sandbox_image: str = "agentdock-sandbox:local"
+    sandbox_cpu_limit: float = 1.0
+    sandbox_memory_limit: str = "512m"
+    sandbox_pids_limit: int = 256
+    sandbox_timeout_seconds: int = 120
+    sandbox_max_output_bytes: int = 256_000
+    sandbox_network_disabled: bool = True
+    # github = clone on worker with installation token; fixture = copy local fixture (dev/CI)
+    sandbox_checkout_mode: str = "fixture"
+    sandbox_fixture_repo_path: str = ""
+    execution_queue_key: str = "agentdock:executions"
+    execution_rate_limit_attempts: int = 10
+    execution_rate_limit_window_seconds: int = 60
+    execution_max_active_per_user: int = 3
+    worker_concurrency: int = 2
+    worker_reconcile_stale_seconds: int = 900
+    # Command argv length / count bounds
+    execution_max_command_args: int = 32
+    execution_max_arg_length: int = 256
+
+    # Agent / LLM (Phase 5)
+    llm_provider: str = ""  # openai | fake | ollama
+    llm_model: str = "gpt-4o-mini"
+    openai_api_key: str = ""
+    openai_api_base: str = "https://api.openai.com/v1"
+    ollama_base_url: str = "http://localhost:11434"
+    agent_queue_key: str = "agentdock:agent_runs"
+    agent_max_steps: int = 20
+    agent_max_tool_calls: int = 40
+    agent_max_runtime_seconds: int = 600
+    agent_max_context_chars: int = 48_000
+    agent_max_file_read_bytes: int = 64_000
+    agent_max_search_results: int = 40
+    agent_max_tool_output_chars: int = 16_000
+    agent_max_diff_chars: int = 80_000
+    agent_max_task_chars: int = 4_000
+    agent_max_active_per_user: int = 2
+    agent_llm_retries: int = 2
+
+    # Realtime WebSocket (Phase 6)
+    ws_max_connections_per_user: int = 10
+    ws_max_connections_per_run: int = 5
+    ws_command_chunk_chars: int = 512
 
     @cached_property
     def cors_origin_list(self) -> list[str]:
@@ -41,6 +125,45 @@ class Settings(BaseSettings):
             return [str(item) for item in json.loads(text)]
         return [part.strip() for part in text.split(",") if part.strip()]
 
+    @property
+    def cookie_secure_flag(self) -> bool:
+        if self.cookie_secure is not None:
+            return self.cookie_secure
+        return self.app_env.lower() not in {"development", "test", "local"}
+
+    @property
+    def sync_database_url(self) -> str:
+        """Alembic/sync drivers need a non-asyncpg URL."""
+        return self.database_url.replace("postgresql+asyncpg://", "postgresql+psycopg://", 1)
+
+    @property
+    def github_configured(self) -> bool:
+        return bool(
+            self.github_app_id
+            and self.github_app_client_id
+            and self.github_app_client_secret
+            and (self.github_app_private_key or self.github_app_private_key_path)
+            and self.github_webhook_secret
+        )
+
+    @property
+    def agent_configured(self) -> bool:
+        provider = self.llm_provider.lower().strip()
+        if provider == "fake":
+            return True
+        if provider == "openai":
+            return bool(self.openai_api_key)
+        if provider == "ollama":
+            return bool(self.ollama_base_url)
+        return False
+
+    def github_private_key_pem(self) -> str:
+        raw = self.github_app_private_key.strip()
+        if raw:
+            return raw.replace("\\n", "\n")
+        if self.github_app_private_key_path:
+            return Path(self.github_app_private_key_path).expanduser().read_text(encoding="utf-8")
+        raise ValueError("GitHub App private key is not configured")
 
 @lru_cache
 def get_settings() -> Settings:

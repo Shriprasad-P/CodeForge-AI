@@ -42,11 +42,16 @@ def get_engine() -> AsyncEngine:
     return _engine
 
 
-@asynccontextmanager
-async def session_scope() -> AsyncIterator[AsyncSession]:
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
     if _session_factory is None:
         raise RuntimeError("Database session factory is not initialized")
-    async with _session_factory() as session:
+    return _session_factory
+
+
+@asynccontextmanager
+async def session_scope() -> AsyncIterator[AsyncSession]:
+    factory = get_session_factory()
+    async with factory() as session:
         yield session
 
 

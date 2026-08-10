@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+coverage
+*.log
+.env*
+!.env.example
+README.md
+vitest.config.ts
+vitest.setup.ts
+src/**/*.test.ts
+src/**/*.test.tsx

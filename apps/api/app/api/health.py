@@ -61,8 +61,11 @@ async def ready() -> JSONResponse:
 @router.get("/api/metrics")
 async def metrics() -> Response:
     """Prometheus-compatible metrics (Phase 1: process + dependency gauges)."""
+    from app.services.agent_events import metrics_snapshot
+
     pg_ok = 1 if await check_db() else 0
     redis_ok = 1 if await check_redis() else 0
+    rt = metrics_snapshot()
     lines = [
         "# HELP agentdock_up API process up",
         "# TYPE agentdock_up gauge",
@@ -73,6 +76,18 @@ async def metrics() -> Response:
         "# HELP agentdock_redis_up Redis connectivity",
         "# TYPE agentdock_redis_up gauge",
         f"agentdock_redis_up {redis_ok}",
+        "# HELP websocket_active_connections Live agent-run WebSocket clients",
+        "# TYPE websocket_active_connections gauge",
+        f"websocket_active_connections {rt['websocket_active_connections']}",
+        "# HELP agent_events_published_total Agent realtime events published",
+        "# TYPE agent_events_published_total counter",
+        f"agent_events_published_total {rt['agent_events_published_total']}",
+        "# HELP agent_event_publish_failures_total Failed agent event publishes",
+        "# TYPE agent_event_publish_failures_total counter",
+        f"agent_event_publish_failures_total {rt['agent_event_publish_failures_total']}",
+        "# HELP websocket_disconnects_total WebSocket disconnects",
+        "# TYPE websocket_disconnects_total counter",
+        f"websocket_disconnects_total {rt['websocket_disconnects_total']}",
         "",
     ]
     return PlainTextResponse("\n".join(lines), media_type="text/plain; version=0.0.4")

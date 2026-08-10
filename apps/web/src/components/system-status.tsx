@@ -16,12 +16,35 @@ function StatusDot({ ok }: { ok: boolean | undefined }) {
 }
 
 export function SystemStatus() {
-  const health = useQuery({ queryKey: ["health"], queryFn: fetchHealth });
-  const ready = useQuery({ queryKey: ["ready"], queryFn: fetchReady });
+  const health = useQuery({
+    queryKey: ["health"],
+    queryFn: fetchHealth,
+    refetchInterval: 5_000,
+  });
+  const ready = useQuery({
+    queryKey: ["ready"],
+    queryFn: fetchReady,
+    refetchInterval: 5_000,
+  });
 
   const apiUp = health.isSuccess;
-  const postgres = ready.data?.checks.postgres;
-  const redis = ready.data?.checks.redis;
+  const postgres = ready.isSuccess ? ready.data.checks.postgres : undefined;
+  const redis = ready.isSuccess ? ready.data.checks.redis : undefined;
+
+  const postgresLabel = ready.isLoading
+    ? "checking…"
+    : ready.isError
+      ? "unreachable"
+      : postgres
+        ? "ready"
+        : "not ready";
+  const redisLabel = ready.isLoading
+    ? "checking…"
+    : ready.isError
+      ? "unreachable"
+      : redis
+        ? "ready"
+        : "not ready";
 
   return (
     <section
@@ -47,14 +70,14 @@ export function SystemStatus() {
           <span className="text-muted">PostgreSQL</span>
           <span className="flex items-center gap-2">
             <StatusDot ok={postgres} />
-            {ready.isLoading ? "checking…" : postgres ? "ready" : "not ready"}
+            {postgresLabel}
           </span>
         </li>
         <li className="flex items-center justify-between gap-4">
           <span className="text-muted">Redis</span>
           <span className="flex items-center gap-2">
             <StatusDot ok={redis} />
-            {ready.isLoading ? "checking…" : redis ? "ready" : "not ready"}
+            {redisLabel}
           </span>
         </li>
       </ul>

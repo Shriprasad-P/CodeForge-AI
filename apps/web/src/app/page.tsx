@@ -1,4 +1,8 @@
+import Link from "next/link";
+
 import { SystemStatus } from "@/components/system-status";
+
+const apiDocsUrl = `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/docs`;
 
 export default function HomePage() {
   return (
@@ -15,11 +19,17 @@ export default function HomePage() {
             Status
           </a>
           <a
-            href="/docs"
+            href={apiDocsUrl}
             className="text-muted transition hover:text-foreground"
           >
-            Docs
+            API docs
           </a>
+          <Link
+            href="/login"
+            className="text-muted transition hover:text-foreground"
+          >
+            Sign in
+          </Link>
         </nav>
       </header>
 
@@ -33,14 +43,18 @@ export default function HomePage() {
             describe a task, review the diff, approve the pull request.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
-            <button
-              type="button"
-              disabled
-              title="Available in Phase 2"
-              className="rounded-lg bg-accent px-5 py-2.5 text-sm font-semibold text-background opacity-80"
+            <Link
+              href="/login"
+              className="rounded-lg bg-accent px-5 py-2.5 text-sm font-semibold text-background"
             >
               Sign in
-            </button>
+            </Link>
+            <Link
+              href="/register"
+              className="rounded-lg border border-border bg-surface px-5 py-2.5 text-sm font-semibold text-foreground"
+            >
+              Create account
+            </Link>
             <button
               type="button"
               disabled
@@ -51,8 +65,7 @@ export default function HomePage() {
             </button>
           </div>
           <p className="mt-3 text-xs text-muted">
-            Auth and GitHub App land in Phases 2–3. Phase 1 verifies the control
-            plane is healthy.
+            Phase 2 adds email/password auth. GitHub App lands in Phase 3.
           </p>
         </div>
 

@@ -1,14 +1,90 @@
-# GitHub App Setup
+# GitHub App Setup (Phase 3)
 
-Phase 3 will implement the GitHub App flow. Prepare credentials early:
+AgentDock uses a **GitHub App** (not a long-lived personal access token) for installation-scoped repository access.
 
-1. Create a GitHub App with permissions:
-   - Repository contents: read and write
-   - Pull requests: read and write
-   - Issues: read
-   - Metadata: read
-2. Generate a private key (`.pem`) and store it outside the repo (see `.env.example`).
-3. Set webhook URL to `https://<api-host>/api/github/webhook` with a strong webhook secret.
-4. Record App ID, Client ID, Client Secret, and App slug in `.env`.
+## Create the App
 
-Do not commit private keys.
+1. GitHub → Settings → Developer settings → GitHub Apps → New GitHub App.
+2. Suggested fields:
+   - **GitHub App name:** `AgentDock` (or `AgentDock-dev` for local)
+   - **Homepage URL:** `http://localhost:3000`
+   - **Callback URL:** `http://localhost:8000/api/github/callback`
+   - **Setup URL (optional):** `http://localhost:8000/api/github/setup`
+   - **Webhook URL:** `http://localhost:8000/api/github/webhooks` (use a tunnel such as ngrok for local delivery)
+   - **Webhook secret:** generate a strong random string; set `GITHUB_WEBHOOK_SECRET`
+3. Generate a private key (`.pem`). Store it outside git, or paste into `GITHUB_APP_PRIVATE_KEY` with `\n` newlines.
+4. Copy App ID, Client ID, Client Secret, and App slug into `.env`.
+
+## Permissions (Phase 3 minimum)
+
+Repository permissions:
+
+| Permission | Access | Why |
+|------------|--------|-----|
+| **Metadata** | Read-only | List installation repositories and read safe repo metadata |
+
+Do **not** request for Phase 3:
+
+- Contents: write
+- Pull requests: write
+- Administration: write
+
+Later phases can expand permissions deliberately when cloning, editing, or opening PRs is implemented.
+
+Account permissions: none required beyond the App’s user-to-server OAuth for identity linking.
+
+## Webhook events
+
+Subscribe to:
+
+- `installation`
+- `installation_repositories`
+
+AgentDock verifies `X-Hub-Signature-256` with constant-time compare and idempotently records `X-GitHub-Delivery`.
+
+## Environment variables
+
+```text
+GITHUB_APP_ID=
+GITHUB_APP_SLUG=agentdock
+GITHUB_APP_CLIENT_ID=
+GITHUB_APP_CLIENT_SECRET=
+GITHUB_APP_PRIVATE_KEY=        # PEM with \n escapes, or use path below
+GITHUB_APP_PRIVATE_KEY_PATH=   # e.g. ./secrets/github-app.pem
+GITHUB_WEBHOOK_SECRET=
+GITHUB_CALLBACK_URL=http://localhost:8000/api/github/callback
+GITHUB_SETUP_URL=http://localhost:8000/api/github/setup
+GITHUB_FRONTEND_SUCCESS_URL=http://localhost:3000/github
+```
+
+If these are unset, the API still starts. `/api/github/status` reports `configured: false` and the UI shows “GitHub integration is not configured”.
+
+## Connection flow
+
+```text
+Login → /github → Connect GitHub
+  → GitHub OAuth (link identity to existing AgentDock user)
+  → GitHub App install (personal account or org)
+  → Setup callback claims installation
+  → List repos via installation token (temporary, server-side only)
+  → Connect repository (persists metadata)
+  → Disconnect repository (local only; does not uninstall the App)
+```
+
+## Security notes
+
+- Private key, client secret, webhook secret, and installation tokens never leave the API.
+- Installation tokens are generated on demand and are not persisted or returned to the browser.
+- OAuth `state` is bound to the authenticated user in Redis, single-use, and TTL-limited.
+- All installation/connection queries are scoped to `current_user.id`.
+
+## Local testing without live GitHub
+
+Unit/integration tests mock GitHub HTTP at the client boundary and generate ephemeral RSA keys. Live App credentials are optional.
+
+## Production considerations
+
+- Use HTTPS callback/webhook/setup URLs.
+- Rotate webhook secret and private key if leaked.
+- Prefer mounting the PEM via secret volume (`GITHUB_APP_PRIVATE_KEY_PATH`) over baking into images.
+- Do not commit real secrets or `.pem` files.
