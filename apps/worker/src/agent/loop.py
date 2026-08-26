@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import time
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -26,6 +25,13 @@ from sandbox_sdk import SandboxSpec
 from sandbox_sdk.docker_provider import DockerSandboxProvider
 from src.agent.llm import LLMProvider, get_llm_provider
 from src.agent.tools import AgentTools
+from src.artifacts import (
+    ArtifactCaptureError,
+    ArtifactTooLarge,
+    PUBLICATION_ARTIFACT_VERSION,
+    capture_publication_artifact,
+    prepare_trusted_capture_checkout,
+)
 from src.checkout import assert_remote_sanitized, clone_github_repo, prepare_fixture_checkout
 
 logger = get_logger(__name__)
@@ -75,6 +81,14 @@ async def finish_agent_run(
     diff_stat: str | None = None,
     diff_text: str | None = None,
     diff_truncated: bool = False,
+    publication_artifact: bytes | None = None,
+    publication_artifact_hash: str | None = None,
+    publication_artifact_size: int | None = None,
+    publication_artifact_version: int | None = None,
+    publication_change_manifest: list | None = None,
+    publication_artifact_status: str | None = None,
+    publication_artifact_error: str | None = None,
+    validation_artifact_hash: str | None = None,
 ) -> None:
     fresh = await db.get(AgentRun, run.id)
     if fresh is None:
@@ -101,6 +115,23 @@ async def finish_agent_run(
     if diff_text is not None:
         fresh.diff_text = diff_text
     fresh.diff_truncated = diff_truncated
+    if publication_artifact is not None:
+        fresh.publication_artifact = publication_artifact
+    if publication_artifact_hash is not None:
+        fresh.publication_artifact_hash = publication_artifact_hash
+        fresh.diff_hash = publication_artifact_hash
+    if publication_artifact_size is not None:
+        fresh.publication_artifact_size = publication_artifact_size
+    if publication_artifact_version is not None:
+        fresh.publication_artifact_version = publication_artifact_version
+    if publication_change_manifest is not None:
+        fresh.publication_change_manifest = publication_change_manifest
+    if publication_artifact_status is not None:
+        fresh.publication_artifact_status = publication_artifact_status
+    if publication_artifact_error is not None:
+        fresh.publication_artifact_error = publication_artifact_error[:1024]
+    if validation_artifact_hash is not None:
+        fresh.validation_artifact_hash = validation_artifact_hash
     fresh.finished_at = datetime.now(timezone.utc)
     await db.commit()
 
@@ -373,42 +404,75 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                             "agent.tool.completed",
                             {"tool": "finish", "summary": summary[:500], "ok": True},
                         )
-                        # Capture diff from sandbox
-                        status_res = tools.git_status()
-                        diff_stat = tools.git_diff(stat=True)
-                        diff_full = tools.git_diff(stat=False)
-                        changed = []
-                        ignore_names = {".bashrc", ".profile", ".bash_logout", ".bash_history"}
-                        for line in (status_res.summary or "").splitlines():
-                            line = line.strip()
-                            if not line:
-                                continue
-                            parts = line.split(maxsplit=1)
-                            path = parts[-1] if parts else line
-                            base = path.rstrip("/").split("/")[-1]
-                            if base in ignore_names or "__pycache__" in path:
-                                continue
-                            code = parts[0] if len(parts) > 1 else "M"
-                            change = "modified"
-                            if code.startswith("A") or code.startswith("?"):
-                                change = "created"
-                            elif code.startswith("D"):
-                                change = "deleted"
-                            changed.append({"path": path, "change_type": change})
-                        diff_text = diff_full.summary or ""
-                        truncated = len(diff_text) > settings.agent_max_diff_chars
-                        if truncated:
-                            diff_text = diff_text[: settings.agent_max_diff_chars]
-                        ok = True
-                        result_status = "succeeded"
-                        err_type = None
-                        final_status = AgentRunStatus.awaiting_approval
-                        if last_validation and not last_validation.get("ok"):
-                            ok = False
-                            result_status = "failed_validation"
-                            err_type = AgentRunErrorType.failed_validation
-                            final_status = AgentRunStatus.failed
-                        diff_hash = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
+                        # Pull the final sandbox workspace back to the trusted worker
+                        # before capturing the immutable publication artifact. The
+                        # original host checkout is intentionally left untouched.
+                        exported_workspace = work_dir / "workspace-export"
+                        final_workspace = work_dir / "workspace-final"
+                        provider.get_directory(sandbox_id, "/workspace", str(exported_workspace))
+                        prepare_trusted_capture_checkout(repo_path, exported_workspace, final_workspace)
+                        validation = last_validation or {
+                            "command": None,
+                            "exit_code": None,
+                            "ok": False,
+                            "output": "Final validation command is required",
+                        }
+                        try:
+                            artifact = capture_publication_artifact(
+                                final_workspace,
+                                base_sha=base_sha,
+                                max_artifact_bytes=settings.agent_max_publication_artifact_bytes,
+                                max_preview_chars=settings.agent_max_diff_preview_chars,
+                            )
+                        except ArtifactTooLarge as exc:
+                            await finish_agent_run(
+                                db,
+                                run,
+                                status=AgentRunStatus.failed,
+                                error_type=AgentRunErrorType.artifact_too_large,
+                                error_message="Publication artifact exceeds the configured size limit",
+                                summary=summary,
+                                result_status="artifact_too_large",
+                                changed_files=exc.manifest,
+                                validation=validation,
+                                diff_stat="",
+                                diff_text="",
+                                diff_truncated=False,
+                                publication_artifact_size=exc.size,
+                                publication_artifact_status="too_large",
+                                publication_artifact_error="Publication artifact exceeds the configured size limit",
+                            )
+                            await events.publish("agent.run.failed", {"status": "failed", "error": "artifact_too_large"})
+                            finished = True
+                            break
+                        except ArtifactCaptureError:
+                            await finish_agent_run(
+                                db,
+                                run,
+                                status=AgentRunStatus.failed,
+                                error_type=AgentRunErrorType.unsupported_artifact,
+                                error_message="Publication artifact could not be captured safely",
+                                summary=summary,
+                                result_status="artifact_capture_failed",
+                                validation=validation,
+                                publication_artifact_status="invalid",
+                                publication_artifact_error="Publication artifact could not be captured safely",
+                            )
+                            await events.publish("agent.run.failed", {"status": "failed", "error": "artifact_capture_failed"})
+                            finished = True
+                            break
+
+                        ok = validation.get("ok") is True and isinstance(validation.get("command"), list)
+                        result_status = "succeeded" if ok else "failed_validation"
+                        err_type = None if ok else AgentRunErrorType.failed_validation
+                        final_status = (
+                            AgentRunStatus.awaiting_approval
+                            if ok and artifact.artifact_size
+                            else AgentRunStatus.succeeded
+                            if ok
+                            else AgentRunStatus.failed
+                        )
+                        artifact_status = "ready" if artifact.artifact_size else "empty"
                         await finish_agent_run(
                             db,
                             run,
@@ -416,38 +480,49 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                             error_type=err_type,
                             error_message=None if ok else "Validation failed",
                             summary=summary,
-                            result_status=result_status,
-                            changed_files=changed,
-                            validation=last_validation,
-                            diff_stat=diff_stat.summary or "",
-                            diff_text=diff_text,
-                            diff_truncated=truncated,
+                            result_status=result_status if artifact.artifact_size or not ok else "no_changes",
+                            changed_files=artifact.manifest,
+                            validation=validation,
+                            diff_stat=artifact.diff_stat,
+                            diff_text=artifact.preview,
+                            diff_truncated=artifact.preview_truncated,
+                            publication_artifact=artifact.patch,
+                            publication_artifact_hash=artifact.artifact_hash,
+                            publication_artifact_size=artifact.artifact_size,
+                            publication_artifact_version=PUBLICATION_ARTIFACT_VERSION,
+                            publication_change_manifest=artifact.manifest,
+                            publication_artifact_status=artifact_status,
+                            validation_artifact_hash=artifact.artifact_hash if ok else None,
                         )
-                        fresh_after_finish = await db.get(AgentRun, run.id)
-                        if fresh_after_finish is not None:
-                            fresh_after_finish.diff_hash = diff_hash
-                            fresh_after_finish.publication_status = "pending"
-                            await db.commit()
-                        await events.publish("agent.files.changed", {"files": changed})
+                        await events.publish("agent.files.changed", {"files": artifact.manifest})
                         await events.publish(
                             "agent.diff.ready",
-                            {"truncated": truncated, "stat_preview": (diff_stat.summary or "")[:500]},
+                            {
+                                "truncated": artifact.preview_truncated,
+                                "preview_truncated": artifact.preview_truncated,
+                                "artifact_hash": artifact.artifact_hash,
+                                "artifact_version": PUBLICATION_ARTIFACT_VERSION,
+                                "stat_preview": artifact.diff_stat[:500],
+                            },
                         )
                         await events.publish("agent.run.status", {"status": final_status.value})
                         if final_status == AgentRunStatus.awaiting_approval:
                             await events.publish(
                                 "agent.approval.required",
-                                {"status": final_status.value, "diff_hash": diff_hash},
+                                {
+                                    "status": final_status.value,
+                                    "diff_hash": artifact.artifact_hash,
+                                    "artifact_hash": artifact.artifact_hash,
+                                    "artifact_version": PUBLICATION_ARTIFACT_VERSION,
+                                    "base_commit_sha": base_sha,
+                                },
                             )
                         else:
                             await events.publish(
                                 _terminal_event(final_status),
                                 {"status": final_status.value, "result_status": result_status},
                             )
-                        logger.info(
-                            "agent.run.succeeded" if ok else "agent.run.failed",
-                            agent_run_id=str(run.id),
-                        )
+                        logger.info("agent.run.succeeded" if ok else "agent.run.failed", agent_run_id=str(run.id))
                         finished = True
                         break
 
@@ -486,13 +561,6 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                             run.changed_files = changed[:200]
                             await db.commit()
                             await events.publish("agent.files.changed", {"files": changed[:50]})
-                    if call.name == "run_command":
-                        last_validation = {
-                            "command": call.arguments.get("command"),
-                            "exit_code": (result.data or {}).get("exit_code"),
-                            "ok": result.ok,
-                            "output": result.summary[:2000],
-                        }
                     messages.append(
                         {
                             "role": "assistant",

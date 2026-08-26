@@ -164,7 +164,10 @@ Bounded stdout/stderr (`output_truncated` when clipped).
 
 ### `POST /api/agent-runs/{id}/approve` → **200** / **404** / **409**
 
-Owner-only approval of the persisted validated diff. Queues trusted publication.
+Owner-only approval of an immutable artifact. The request must include
+`artifact_hash`, `artifact_version`, and `base_commit_sha` from the current
+diff response. The server verifies the artifact bytes, manifest, base, and
+validation binding before queuing trusted publication.
 
 ### `POST /api/agent-runs/{id}/reject` → **200** / **404** / **409**
 

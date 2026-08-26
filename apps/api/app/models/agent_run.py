@@ -4,7 +4,7 @@ import enum
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, LargeBinary, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -41,6 +41,8 @@ class AgentRunErrorType(str, enum.Enum):
     publication_failed = "publication_failed"
     repository_changed = "repository_changed"
     approval_invalidated = "approval_invalidated"
+    artifact_too_large = "artifact_too_large"
+    unsupported_artifact = "unsupported_artifact"
 
 
 AGENT_TERMINAL = frozenset(
@@ -117,7 +119,19 @@ class AgentRun(Base, TimestampMixin):
     rejection_reason: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     base_commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     diff_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    publication_artifact: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    publication_artifact_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    publication_artifact_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    publication_artifact_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    publication_change_manifest: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    publication_artifact_status: Mapped[str] = mapped_column(String(32), nullable=False, default="missing")
+    publication_artifact_error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    validation_artifact_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approval_artifact_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approval_artifact_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approval_base_commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     publication_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    publication_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     branch_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     github_pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import select
 import socket
+import shutil
 import tarfile
 import time
 from pathlib import Path
@@ -116,6 +117,65 @@ class DockerSandboxProvider:
         ok = container.put_archive(dest, buf.getvalue())
         if not ok:
             raise RuntimeError("Failed to copy files into sandbox")
+
+    def get_directory(self, sandbox_id: str, container_path: str, host_dir: str) -> None:
+        """Copy a sandbox directory to a worker-owned temporary directory safely."""
+        container = self._client.containers.get(sandbox_id)
+        stream, _ = container.get_archive(container_path.rstrip("/") or "/")
+        payload = b"".join(stream)
+        destination = Path(host_dir)
+        if destination.exists():
+            shutil.rmtree(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        root_name = Path(container_path.rstrip("/") or "/").name
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
+            for member in archive.getmembers():
+                raw_name = member.name.replace("\\", "/")
+                parts = [part for part in raw_name.split("/") if part not in {"", "."}]
+                if parts and parts[0] == root_name:
+                    parts = parts[1:]
+                # The sandbox contents are untrusted data. Never transfer its
+                # Git metadata/configuration back to the worker host.
+                if ".git" in parts:
+                    continue
+                if not parts:
+                    if member.isdir():
+                        continue
+                    raise RuntimeError("sandbox archive contains an unsafe path")
+                if any(part == ".." for part in parts):
+                    raise RuntimeError("sandbox archive contains an unsafe path")
+                target = (destination.joinpath(*parts)).resolve()
+                if destination.resolve() not in target.parents:
+                    raise RuntimeError("sandbox archive escapes destination")
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if member.issym():
+                    link = Path(member.linkname)
+                    if link.is_absolute():
+                        raise RuntimeError("sandbox archive contains an unsafe symlink")
+                    resolved_link = (target.parent / link).resolve()
+                    if destination.resolve() not in resolved_link.parents and resolved_link != destination.resolve():
+                        raise RuntimeError("sandbox archive symlink escapes destination")
+                    relative_link = resolved_link.relative_to(destination.resolve())
+                    if relative_link.parts and relative_link.parts[0] == ".git":
+                        raise RuntimeError("sandbox archive symlink targets Git metadata")
+                    target.symlink_to(member.linkname)
+                    continue
+                if member.islnk():
+                    raise RuntimeError("sandbox archive contains an unsupported hardlink")
+                if not member.isfile():
+                    raise RuntimeError("sandbox archive contains an unsupported entry")
+                source = archive.extractfile(member)
+                if source is None:
+                    raise RuntimeError("sandbox archive file is unreadable")
+                with target.open("wb") as handle:
+                    shutil.copyfileobj(source, handle)
+                try:
+                    target.chmod(member.mode & 0o7777)
+                except OSError:
+                    pass
 
     def exec(
         self,

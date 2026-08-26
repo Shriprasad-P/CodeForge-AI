@@ -49,6 +49,11 @@ class AgentRunResponse(BaseModel):
     rejection_reason: str | None
     base_commit_sha: str | None
     diff_hash: str | None
+    artifact_hash: str | None
+    artifact_size: int | None
+    artifact_version: int | None
+    artifact_status: str
+    preview_truncated: bool
     publication_status: str
     branch_name: str | None
     commit_sha: str | None
@@ -77,6 +82,17 @@ class AgentDiffResponse(BaseModel):
     changed_files: list
     diff_hash: str | None
     base_commit_sha: str | None
+    artifact_hash: str | None
+    artifact_size: int | None
+    artifact_version: int | None
+    artifact_status: str
+    preview_truncated: bool
+
+
+class ApproveAgentRunRequest(BaseModel):
+    artifact_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    artifact_version: int = Field(ge=1)
+    base_commit_sha: str = Field(min_length=40, max_length=64, pattern=r"^[0-9a-f]+$")
 
 
 class AgentStatusResponse(BaseModel):

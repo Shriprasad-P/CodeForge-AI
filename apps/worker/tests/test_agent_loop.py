@@ -125,7 +125,13 @@ async def test_deterministic_agent_e2e(image_ready: str, monkeypatch: pytest.Mon
         assert finished.approval_status == "pending"
         assert finished.base_commit_sha
         assert finished.diff_hash
+        assert finished.publication_artifact_hash == finished.diff_hash
+        assert finished.publication_artifact
+        assert finished.publication_artifact_version == 1
+        assert finished.publication_artifact_status == "ready"
+        assert finished.publication_change_manifest
         assert finished.validation and finished.validation.get("ok") is True
+        assert finished.validation_artifact_hash == finished.diff_hash
         assert finished.changed_files
         assert finished.diff_text is not None
         assert finished.steps_used >= 5

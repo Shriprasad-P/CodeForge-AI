@@ -129,27 +129,52 @@ async def test_agent_approval_is_owner_bound_and_idempotent(app_client: AsyncCli
     )
     run_id = created.json()["id"]
     diff = "diff --git a/README.md b/README.md\n"
+    artifact_hash = hashlib.sha256(diff.encode()).hexdigest()
     factory = get_session_factory()
     async with factory() as session:
         run = await session.get(AgentRun, run_id)
         assert run is not None
         run.status = AgentRunStatus.awaiting_approval
         run.diff_text = diff
-        run.diff_hash = hashlib.sha256(diff.encode()).hexdigest()
+        run.diff_hash = artifact_hash
+        run.publication_artifact = diff.encode()
+        run.publication_artifact_hash = artifact_hash
+        run.publication_artifact_size = len(diff.encode())
+        run.publication_artifact_version = 1
+        run.publication_change_manifest = [{"path": "README.md", "change_type": "modified"}]
+        run.publication_artifact_status = "ready"
+        run.validation = {"command": ["pytest"], "ok": True, "output": "ok"}
+        run.validation_artifact_hash = artifact_hash
         run.base_commit_sha = "a" * 40
         await session.commit()
 
     await app_client.post("/api/auth/logout")
     await _register(app_client, email_b)
-    assert (await app_client.post(f"/api/agent-runs/{run_id}/approve")).status_code == 404
+    assert (
+        await app_client.post(
+            f"/api/agent-runs/{run_id}/approve",
+            json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "a" * 40},
+        )
+    ).status_code == 404
 
     await app_client.post("/api/auth/logout")
     await app_client.post("/api/auth/login", json={"email": email_a, "password": "password123"})
-    approved = await app_client.post(f"/api/agent-runs/{run_id}/approve")
+    stale = await app_client.post(
+        f"/api/agent-runs/{run_id}/approve",
+        json={"artifact_hash": "b" * 64, "artifact_version": 1, "base_commit_sha": "a" * 40},
+    )
+    assert stale.status_code == 409
+    approved = await app_client.post(
+        f"/api/agent-runs/{run_id}/approve",
+        json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "a" * 40},
+    )
     assert approved.status_code == 200, approved.text
     assert approved.json()["approval_status"] == "approved"
     assert approved.json()["publication_status"] == "approved"
-    duplicate = await app_client.post(f"/api/agent-runs/{run_id}/approve")
+    duplicate = await app_client.post(
+        f"/api/agent-runs/{run_id}/approve",
+        json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "a" * 40},
+    )
     assert duplicate.status_code == 409
 
 
@@ -177,3 +202,64 @@ async def test_agent_reject_is_terminal_and_cannot_cancel(app_client: AsyncClien
     assert rejected.json()["status"] == "rejected"
     assert rejected.json()["publication_status"] == "rejected"
     assert (await app_client.post(f"/api/agent-runs/{run_id}/cancel")).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_legacy_diff_cannot_be_approved(app_client: AsyncClient) -> None:
+    email = f"legacy-{uuid4().hex[:8]}@example.com"
+    await _register(app_client, email)
+    connection_id = await _seed_connection(email)
+    created = await app_client.post(
+        "/api/agent-runs",
+        json={"repository_connection_id": connection_id, "task": "Legacy patch."},
+    )
+    run_id = created.json()["id"]
+    factory = get_session_factory()
+    async with factory() as session:
+        run = await session.get(AgentRun, run_id)
+        assert run is not None
+        run.status = AgentRunStatus.awaiting_approval
+        run.diff_text = "legacy diff"
+        run.diff_hash = hashlib.sha256(b"legacy diff").hexdigest()
+        run.base_commit_sha = "c" * 40
+        await session.commit()
+    response = await app_client.post(
+        f"/api/agent-runs/{run_id}/approve",
+        json={"artifact_hash": "d" * 64, "artifact_version": 1, "base_commit_sha": "c" * 40},
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_malformed_manifest_cannot_be_approved(app_client: AsyncClient) -> None:
+    email = f"manifest-{uuid4().hex[:8]}@example.com"
+    await _register(app_client, email)
+    connection_id = await _seed_connection(email)
+    created = await app_client.post(
+        "/api/agent-runs",
+        json={"repository_connection_id": connection_id, "task": "Malformed manifest."},
+    )
+    run_id = created.json()["id"]
+    artifact = b"safe artifact"
+    artifact_hash = hashlib.sha256(artifact).hexdigest()
+    factory = get_session_factory()
+    async with factory() as session:
+        run = await session.get(AgentRun, run_id)
+        assert run is not None
+        run.status = AgentRunStatus.awaiting_approval
+        run.base_commit_sha = "e" * 40
+        run.publication_artifact = artifact
+        run.publication_artifact_hash = artifact_hash
+        run.publication_artifact_size = len(artifact)
+        run.publication_artifact_version = 1
+        run.publication_artifact_status = "ready"
+        run.publication_change_manifest = {"path": "README.md"}
+        run.diff_hash = artifact_hash
+        run.validation = {"command": ["pytest"], "ok": True}
+        run.validation_artifact_hash = artifact_hash
+        await session.commit()
+    response = await app_client.post(
+        f"/api/agent-runs/{run_id}/approve",
+        json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "e" * 40},
+    )
+    assert response.status_code == 409

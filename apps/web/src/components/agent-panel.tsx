@@ -151,7 +151,12 @@ export function AgentPanel() {
   });
 
   const approve = useMutation({
-    mutationFn: approveAgentRun,
+    mutationFn: (input: {
+      id: string;
+      artifact_hash: string;
+      artifact_version: number;
+      base_commit_sha: string;
+    }) => approveAgentRun(input.id, input),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["agent-runs"] });
     },
@@ -321,8 +326,26 @@ export function AgentPanel() {
               <div className="mt-3 flex gap-2">
                 <button
                   type="button"
-                  disabled={approve.isPending || reject.isPending || !diff.data?.diff_hash}
-                  onClick={() => approve.mutate(selected.id)}
+                  disabled={
+                    approve.isPending ||
+                    reject.isPending ||
+                    diff.data?.artifact_status !== "ready" ||
+                    !diff.data?.artifact_hash ||
+                    !diff.data?.artifact_version ||
+                    !diff.data?.base_commit_sha
+                  }
+                  onClick={() => {
+                    if (!diff.data?.artifact_hash || !diff.data.artifact_version || !diff.data.base_commit_sha) {
+                      setError("The immutable publication artifact is unavailable. Refresh and try again.");
+                      return;
+                    }
+                    approve.mutate({
+                      id: selected.id,
+                      artifact_hash: diff.data.artifact_hash,
+                      artifact_version: diff.data.artifact_version,
+                      base_commit_sha: diff.data.base_commit_sha,
+                    });
+                  }}
                   className="rounded-lg bg-accent px-3 py-1.5 text-sm font-semibold text-background disabled:opacity-50"
                 >
                   {approve.isPending ? "Approving…" : "Approve & Create PR"}
@@ -337,7 +360,7 @@ export function AgentPanel() {
                 </button>
               </div>
               <p className="mt-2 text-xs text-muted">
-                Base branch: {selected.base_commit_sha ? selected.base_commit_sha.slice(0, 12) : "unknown"} · Changed files: {files.length}
+                Base commit: {selected.base_commit_sha ? selected.base_commit_sha.slice(0, 12) : "unknown"} · Artifact: {diff.data?.artifact_hash ? `${diff.data.artifact_hash.slice(0, 12)}…` : "unavailable"} · Changed files: {files.length}
               </p>
             </div>
           ) : null}
@@ -412,7 +435,7 @@ export function AgentPanel() {
           <div>
             <h3 className="text-sm font-semibold">Diff</h3>
             {diff.data?.diff_truncated ? (
-              <p className="text-xs text-muted">Diff truncated</p>
+              <p className="text-xs text-muted">Preview truncated. Full change artifact preserved for publication.</p>
             ) : null}
             <pre className="mt-1 max-h-80 overflow-auto rounded-lg bg-background/80 p-3 font-mono text-xs">
               {diff.data?.diff_stat || ""}

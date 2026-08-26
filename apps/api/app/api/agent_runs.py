@@ -14,6 +14,7 @@ from app.schemas.agent_run import (
     AgentRunResponse,
     AgentStatusResponse,
     AgentStepResponse,
+    ApproveAgentRunRequest,
     CreateAgentRunRequest,
 )
 from app.services import agent_run as agent_run_service
@@ -51,6 +52,11 @@ def _run_response(run: AgentRun) -> AgentRunResponse:
         rejection_reason=run.rejection_reason,
         base_commit_sha=run.base_commit_sha,
         diff_hash=run.diff_hash,
+        artifact_hash=run.publication_artifact_hash,
+        artifact_size=run.publication_artifact_size,
+        artifact_version=run.publication_artifact_version,
+        artifact_status=run.publication_artifact_status,
+        preview_truncated=run.diff_truncated,
         publication_status=run.publication_status,
         branch_name=run.branch_name,
         commit_sha=run.commit_sha,
@@ -144,6 +150,11 @@ async def get_agent_diff(
         changed_files=run.changed_files or [],
         diff_hash=run.diff_hash,
         base_commit_sha=run.base_commit_sha,
+        artifact_hash=run.publication_artifact_hash,
+        artifact_size=run.publication_artifact_size,
+        artifact_version=run.publication_artifact_version,
+        artifact_status=run.publication_artifact_status,
+        preview_truncated=run.diff_truncated,
     )
 
 
@@ -160,10 +171,18 @@ async def cancel_agent_run(
 @router.post("/{run_id}/approve", response_model=AgentRunResponse)
 async def approve_agent_run(
     run_id: UUID,
+    payload: ApproveAgentRunRequest,
     user: User = Depends(require_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> AgentRunResponse:
-    run = await agent_run_service.approve_agent_run(db, user_id=user.id, run_id=run_id)
+    run = await agent_run_service.approve_agent_run(
+        db,
+        user_id=user.id,
+        run_id=run_id,
+        artifact_hash=payload.artifact_hash,
+        artifact_version=payload.artifact_version,
+        base_commit_sha=payload.base_commit_sha,
+    )
     return _run_response(run)
 
 

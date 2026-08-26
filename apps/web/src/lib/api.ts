@@ -330,6 +330,11 @@ export type AgentRun = {
   rejection_reason: string | null;
   base_commit_sha: string | null;
   diff_hash: string | null;
+  artifact_hash: string | null;
+  artifact_size: number | null;
+  artifact_version: number | null;
+  artifact_status: string;
+  preview_truncated: boolean;
   publication_status: string;
   branch_name: string | null;
   commit_sha: string | null;
@@ -357,6 +362,11 @@ export type AgentDiff = {
   diff_truncated: boolean;
   changed_files: { path?: string; change_type?: string }[];
   diff_hash: string | null;
+  artifact_hash: string | null;
+  artifact_size: number | null;
+  artifact_version: number | null;
+  artifact_status: string;
+  preview_truncated: boolean;
   base_commit_sha: string | null;
 };
 
@@ -395,8 +405,14 @@ export async function cancelAgentRun(id: string): Promise<AgentRun> {
   return apiFetch<AgentRun>(`/api/agent-runs/${id}/cancel`, { method: "POST" });
 }
 
-export async function approveAgentRun(id: string): Promise<AgentRun> {
-  return apiFetch<AgentRun>(`/api/agent-runs/${id}/approve`, { method: "POST" });
+export async function approveAgentRun(
+  id: string,
+  approval: { artifact_hash: string; artifact_version: number; base_commit_sha: string },
+): Promise<AgentRun> {
+  return apiFetch<AgentRun>(`/api/agent-runs/${id}/approve`, {
+    method: "POST",
+    body: JSON.stringify(approval),
+  });
 }
 
 export async function rejectAgentRun(id: string): Promise<AgentRun> {

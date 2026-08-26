@@ -46,7 +46,9 @@ Soft-disable: if LLM is not configured, `/api/agent-runs/status` reports `config
 | `AGENT_MAX_FILE_READ_BYTES` | 64000 |
 | `AGENT_MAX_SEARCH_RESULTS` | 40 |
 | `AGENT_MAX_TOOL_OUTPUT_CHARS` | 16000 |
-| `AGENT_MAX_DIFF_CHARS` | 80000 |
+| `AGENT_MAX_DIFF_CHARS` | 80000 (tool patch input limit) |
+| `AGENT_MAX_DIFF_PREVIEW_CHARS` | 80000 |
+| `AGENT_MAX_PUBLICATION_ARTIFACT_BYTES` | 8000000 |
 
 ## Success semantics
 

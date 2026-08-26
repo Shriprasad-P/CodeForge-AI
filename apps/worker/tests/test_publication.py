@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import subprocess
 from pathlib import Path
 from uuid import uuid4
@@ -16,6 +15,7 @@ from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.github import GitHubInstallation, RepositoryConnection
 from app.models.user import User
 from sandbox_sdk.docker_provider import DockerSandboxProvider
+from src.artifacts import PUBLICATION_ARTIFACT_VERSION, capture_publication_artifact
 from src.publication import process_publication
 
 
@@ -36,7 +36,12 @@ async def test_publication_commits_pushes_and_is_idempotent(tmp_path: Path, monk
     _git(source, "commit", "-m", "base")
     base_sha = _git(source, "rev-parse", "HEAD")
     (source / "README.md").write_text("before\nafter\n")
-    diff = _git(source, "diff")
+    artifact = capture_publication_artifact(
+        source,
+        base_sha=base_sha,
+        max_artifact_bytes=8_000_000,
+        max_preview_chars=80_000,
+    )
     _git(source, "reset", "--hard", "HEAD")
 
     bare = tmp_path / "remote.git"
@@ -91,13 +96,23 @@ async def test_publication_commits_pushes_and_is_idempotent(tmp_path: Path, monk
             model_name="fake",
             max_steps=20,
             summary="Update README",
-            changed_files=["README.md"],
-            diff_text=diff,
-            diff_hash=hashlib.sha256(diff.encode()).hexdigest(),
+            changed_files=artifact.manifest,
+            diff_text=artifact.preview,
+            diff_hash=artifact.artifact_hash,
+            publication_artifact=artifact.patch,
+            publication_artifact_hash=artifact.artifact_hash,
+            publication_artifact_size=artifact.artifact_size,
+            publication_artifact_version=PUBLICATION_ARTIFACT_VERSION,
+            publication_change_manifest=artifact.manifest,
+            publication_artifact_status="ready",
+            validation_artifact_hash=artifact.artifact_hash,
             base_commit_sha=base_sha,
             approval_status="approved",
+            approval_artifact_hash=artifact.artifact_hash,
+            approval_artifact_version=PUBLICATION_ARTIFACT_VERSION,
+            approval_base_commit_sha=base_sha,
             publication_status="approved",
-            validation=None,
+            validation={"command": None, "ok": True, "output": "No recorded validation command"},
         )
         session.add(run)
         await session.commit()
@@ -128,6 +143,45 @@ async def test_publication_commits_pushes_and_is_idempotent(tmp_path: Path, monk
         assert duplicate is not None
         assert duplicate.commit_sha == published.commit_sha
         assert duplicate.github_pr_number == 1
+
+        tampered = AgentRun(
+            user_id=published.user_id,
+            repository_connection_id=published.repository_connection_id,
+            status=AgentRunStatus.awaiting_approval,
+            task="Tampered publication.",
+            model_provider="fake",
+            model_name="fake",
+            max_steps=20,
+            summary="Tampered",
+            changed_files=artifact.manifest,
+            diff_text=artifact.preview,
+            diff_hash=artifact.artifact_hash,
+            publication_artifact=artifact.patch + b"tamper",
+            publication_artifact_hash=artifact.artifact_hash,
+            publication_artifact_size=artifact.artifact_size,
+            publication_artifact_version=PUBLICATION_ARTIFACT_VERSION,
+            publication_change_manifest=artifact.manifest,
+            publication_artifact_status="ready",
+            validation={"command": None, "ok": True},
+            validation_artifact_hash=artifact.artifact_hash,
+            base_commit_sha=base_sha,
+            approval_status="approved",
+            approval_artifact_hash=artifact.artifact_hash,
+            approval_artifact_version=PUBLICATION_ARTIFACT_VERSION,
+            approval_base_commit_sha=base_sha,
+            publication_status="approved",
+        )
+        session.add(tampered)
+        await session.commit()
+        tampered_id = tampered.id
+
+    await process_publication(tampered_id, DockerSandboxProvider())
+    async with factory() as session:
+        rejected = await session.get(AgentRun, tampered_id)
+        assert rejected is not None
+        assert rejected.publication_status == "publication_failed"
+        assert rejected.github_pr_url is None
+        assert rejected.branch_name is None
 
     await close_redis()
     await close_db()

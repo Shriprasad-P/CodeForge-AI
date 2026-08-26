@@ -19,7 +19,7 @@ from app.services.queue import dequeue_work
 from sandbox_sdk.docker_provider import DockerSandboxProvider
 
 from src.agent.loop import process_agent_run
-from src.publication import process_publication
+from src.publication import process_publication, reconcile_pending_publications
 from src.processor import process_job, reconcile_stale_jobs
 
 configure_logging()
@@ -32,6 +32,7 @@ async def worker_loop() -> None:
     await init_redis()
     provider = DockerSandboxProvider()
     await reconcile_stale_jobs(provider)
+    await reconcile_pending_publications()
     logger.info(
         "worker.started",
         concurrency=settings.worker_concurrency,

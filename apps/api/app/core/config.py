@@ -111,6 +111,8 @@ class Settings(BaseSettings):
     agent_max_search_results: int = 40
     agent_max_tool_output_chars: int = 16_000
     agent_max_diff_chars: int = 80_000
+    agent_max_diff_preview_chars: int = 80_000
+    agent_max_publication_artifact_bytes: int = 8_000_000
     agent_max_task_chars: int = 4_000
     agent_max_active_per_user: int = 2
     agent_llm_retries: int = 2

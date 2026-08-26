@@ -67,8 +67,10 @@ export function useAgentRunSocket({
     seenSeq.current = new Set();
     setWsFailed(false);
     setReconnecting(false);
+    setLiveStatus(null);
     setActivity([]);
     setLogs([]);
+    setChangedFiles([]);
     let socket: WebSocket | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
@@ -95,6 +97,7 @@ export function useAgentRunSocket({
 
     function handleEvent(raw: AgentStreamEvent) {
       if (raw.version !== SUPPORTED_VERSION) return;
+      if (raw.run_id !== activeRunId) return;
       if (raw.sequence > 0) {
         if (seenSeq.current.has(raw.sequence)) return;
         seenSeq.current.add(raw.sequence);
@@ -166,18 +169,32 @@ export function useAgentRunSocket({
           onStatusHintRef.current?.("awaiting_approval");
           break;
         case "agent.approved":
+          setLiveStatus("approved");
           pushActivity("Publication approved", raw.timestamp);
           break;
         case "agent.rejected":
+          setLiveStatus("rejected");
           pushActivity("Publication rejected", raw.timestamp);
           break;
         case "publication.started":
+          setLiveStatus("publishing");
+          pushActivity(statusLabel(raw.event.replace("publication.", "")), raw.timestamp);
+          onNeedRestSyncRef.current?.();
+          break;
         case "publication.validation.started":
         case "publication.validation.completed":
         case "publication.commit.created":
         case "publication.branch.pushed":
+          pushActivity(statusLabel(raw.event.replace("publication.", "")), raw.timestamp);
+          onNeedRestSyncRef.current?.();
+          break;
         case "publication.pr.created":
+          setLiveStatus("succeeded");
+          pushActivity(statusLabel(raw.event.replace("publication.", "")), raw.timestamp);
+          onNeedRestSyncRef.current?.();
+          break;
         case "publication.failed":
+          setLiveStatus("failed");
           pushActivity(statusLabel(raw.event.replace("publication.", "")), raw.timestamp);
           onNeedRestSyncRef.current?.();
           break;

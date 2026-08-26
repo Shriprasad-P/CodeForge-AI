@@ -88,7 +88,8 @@ See [sandbox.md](./sandbox.md) for residual risks (disk quota, worker socket pri
 | Threat | Mitigation |
 |--------|------------|
 | Unauthorized publication | Owner-scoped approval endpoint; atomic pending-to-approved transition |
-| Diff substitution | SHA-256 fingerprint persisted with the run and checked before and after apply |
+| Diff substitution | Immutable full artifact plus deterministic manifest, SHA-256 hash/version, approval binding, and exact recapture comparison before apply/commit |
+| Sandbox-to-worker Git execution | Export excludes `.git`; capture overlays data onto a worker-owned checkout, isolates Git config/attributes, disables replace refs and external diff hooks, and force-adds ignored files |
 | Stale repository base | Exact recorded HEAD required; no automatic rebase |
 | Duplicate commit/PR | Deterministic branch; durable commit/PR state; existing PR lookup on retry |
 | Credential exposure | Short-lived installation token stays in trusted worker; remote URL sanitized; never copied to sandbox |

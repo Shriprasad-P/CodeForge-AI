@@ -35,6 +35,9 @@ class SandboxProvider(Protocol):
     def put_directory(self, sandbox_id: str, host_dir: str, container_path: str) -> None:
         """Copy a host directory into the sandbox."""
 
+    def get_directory(self, sandbox_id: str, container_path: str, host_dir: str) -> None:
+        """Copy a sandbox directory into a trusted worker-owned temporary directory."""
+
     def exec(
         self,
         sandbox_id: str,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -23,6 +25,34 @@ from app.models.user import User
 from app.services.queue import enqueue_agent_run, enqueue_publication
 
 logger = get_logger(__name__)
+
+
+def _is_valid_change_manifest(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    allowed_types = {"added", "deleted", "modified", "renamed", "mode_changed"}
+    for entry in value:
+        if not isinstance(entry, dict):
+            return False
+        path = entry.get("path")
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part == ".." for part in path.split("/"))
+        ):
+            return False
+        if entry.get("change_type") not in allowed_types:
+            return False
+        if any(
+            key in entry and not isinstance(entry[key], str)
+            for key in ("old_mode", "new_mode", "old_blob", "new_blob", "previous_path")
+        ):
+            return False
+        if "binary" in entry and not isinstance(entry["binary"], bool):
+            return False
+    return True
 
 
 async def create_agent_run(
@@ -154,13 +184,48 @@ async def request_cancel(db: AsyncSession, *, user_id: UUID, run_id: UUID) -> Ag
     return run
 
 
-async def approve_agent_run(db: AsyncSession, *, user_id: UUID, run_id: UUID) -> AgentRun:
-    """Atomically authorize exactly one persisted, validated diff for publication."""
+async def approve_agent_run(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    run_id: UUID,
+    artifact_hash: str,
+    artifact_version: int,
+    base_commit_sha: str,
+) -> AgentRun:
+    """Atomically authorize exactly one immutable, validated artifact for publication."""
     run = await get_user_run(db, user_id=user_id, run_id=run_id)
-    if run.status != AgentRunStatus.awaiting_approval or not run.diff_text or not run.diff_hash:
+    if run.status != AgentRunStatus.awaiting_approval:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not awaiting approval")
     if run.approval_status != "pending" or run.publication_status != "pending":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run approval is no longer available")
+    artifact = bytes(run.publication_artifact) if run.publication_artifact is not None else None
+    persisted_hash = run.publication_artifact_hash
+    if (
+        run.publication_artifact_status != "ready"
+        or artifact is None
+        or not persisted_hash
+        or run.publication_artifact_size is None
+        or run.publication_artifact_version is None
+        or not _is_valid_change_manifest(run.publication_change_manifest)
+    ):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run has no publishable artifact")
+    if len(artifact) != run.publication_artifact_size:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Publication artifact is inconsistent")
+    calculated_hash = hashlib.sha256(artifact).hexdigest()
+    if not hmac.compare_digest(calculated_hash, persisted_hash) or not hmac.compare_digest(persisted_hash, run.diff_hash or ""):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Publication artifact integrity check failed")
+    if artifact_version != run.publication_artifact_version or not hmac.compare_digest(artifact_hash, persisted_hash):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Approval references a stale artifact")
+    if not run.base_commit_sha or base_commit_sha != run.base_commit_sha:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Approval references a stale base commit")
+    if (
+        not isinstance(run.validation, dict)
+        or run.validation.get("ok") is not True
+        or not run.validation_artifact_hash
+        or not hmac.compare_digest(run.validation_artifact_hash, persisted_hash)
+    ):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Artifact validation is missing or stale")
     connection = await db.scalar(
         select(RepositoryConnection).where(
             RepositoryConnection.id == run.repository_connection_id,
@@ -179,14 +244,36 @@ async def approve_agent_run(db: AsyncSession, *, user_id: UUID, run_id: UUID) ->
             AgentRun.status == AgentRunStatus.awaiting_approval,
             AgentRun.approval_status == "pending",
             AgentRun.publication_status == "pending",
+            AgentRun.publication_artifact_status == "ready",
+            AgentRun.publication_artifact_hash == persisted_hash,
+            AgentRun.publication_artifact_version == artifact_version,
+            AgentRun.base_commit_sha == base_commit_sha,
+            AgentRun.validation_artifact_hash == persisted_hash,
         )
-        .values(approval_status="approved", approved_by_user_id=user_id, approved_at=now, publication_status="approved")
+        .values(
+            approval_status="approved",
+            approved_by_user_id=user_id,
+            approved_at=now,
+            approval_artifact_hash=persisted_hash,
+            approval_artifact_version=artifact_version,
+            approval_base_commit_sha=base_commit_sha,
+            publication_status="approved",
+        )
     )
     if changed.rowcount != 1:
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run approval is already being processed")
     await db.commit()
-    await enqueue_publication(run_id)
+    try:
+        await enqueue_publication(run_id)
+    except Exception as exc:  # noqa: BLE001
+        # The approval is durable in PostgreSQL. A worker startup reconciler
+        # will requeue it, so Redis loss cannot silently lose publication.
+        logger.error("agent.publication_enqueue_failed", agent_run_id=str(run_id), error=str(exc)[:200])
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Publication queued durably; retry shortly",
+        ) from None
     from app.services.agent_events import publish_agent_event
 
     await publish_agent_event(run_id, "agent.approved", {"publication_status": "approved"})
