@@ -13,6 +13,7 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.session import get_session_factory
 from app.models.agent_run import (
+    AGENT_ACTIVE,
     AGENT_TERMINAL,
     AgentRun,
     AgentRunErrorType,
@@ -33,6 +34,7 @@ from src.artifacts import (
     prepare_trusted_capture_checkout,
 )
 from src.checkout import assert_remote_sanitized, clone_github_repo, prepare_fixture_checkout
+from src.delivery import DeliveryClaim, DeliveryClaimLost
 
 logger = get_logger(__name__)
 
@@ -49,14 +51,24 @@ def _terminal_event(status: AgentRunStatus) -> str:
     return "agent.run.failed"
 
 
-async def claim_agent_run(db: AsyncSession, run_id: UUID) -> AgentRun | None:
+async def claim_agent_run(
+    db: AsyncSession,
+    run_id: UUID,
+    delivery_claim: DeliveryClaim | None = None,
+) -> AgentRun | None:
+    conditions = [AgentRun.id == run_id, AgentRun.cancel_requested.is_(False)]
+    if delivery_claim is None:
+        conditions.append(AgentRun.status == AgentRunStatus.queued)
+    else:
+        conditions.extend(
+            [
+                AgentRun.status.in_(tuple(AGENT_ACTIVE)),
+                AgentRun.delivery_claim_token == delivery_claim.token,
+            ]
+        )
     result = await db.execute(
         update(AgentRun)
-        .where(
-            AgentRun.id == run_id,
-            AgentRun.status == AgentRunStatus.queued,
-            AgentRun.cancel_requested.is_(False),
-        )
+        .where(*conditions)
         .values(status=AgentRunStatus.planning, started_at=datetime.now(timezone.utc))
         .returning(AgentRun.id)
     )
@@ -89,50 +101,64 @@ async def finish_agent_run(
     publication_artifact_status: str | None = None,
     publication_artifact_error: str | None = None,
     validation_artifact_hash: str | None = None,
+    delivery_claim: DeliveryClaim | None = None,
 ) -> None:
     fresh = await db.get(AgentRun, run.id)
     if fresh is None:
         return
-    if fresh.status == AgentRunStatus.cancelled:
+    if delivery_claim is not None and fresh.delivery_claim_token != delivery_claim.token:
+        raise DeliveryClaimLost("agent delivery claim lost")
+    if fresh.status in AGENT_TERMINAL:
         return
-    if fresh.cancel_requested and status == AgentRunStatus.succeeded:
+    if fresh.cancel_requested and status in {AgentRunStatus.succeeded, AgentRunStatus.awaiting_approval}:
         status = AgentRunStatus.cancelled
         error_type = AgentRunErrorType.cancelled
         error_message = "Cancelled"
-    fresh.status = status
-    fresh.error_type = error_type
-    fresh.error_message = (error_message or "")[:1024] or None
+    values = {
+        "status": status,
+        "error_type": error_type,
+        "error_message": (error_message or "")[:1024] or None,
+        "finished_at": datetime.now(timezone.utc),
+    }
     if summary is not None:
-        fresh.summary = summary[:4000]
+        values["summary"] = summary[:4000]
     if result_status is not None:
-        fresh.result_status = result_status
+        values["result_status"] = result_status
     if changed_files is not None:
-        fresh.changed_files = changed_files
+        values["changed_files"] = changed_files
     if validation is not None:
-        fresh.validation = validation
+        values["validation"] = validation
     if diff_stat is not None:
-        fresh.diff_stat = diff_stat
+        values["diff_stat"] = diff_stat
     if diff_text is not None:
-        fresh.diff_text = diff_text
-    fresh.diff_truncated = diff_truncated
+        values["diff_text"] = diff_text
+    values["diff_truncated"] = diff_truncated
     if publication_artifact is not None:
-        fresh.publication_artifact = publication_artifact
+        values["publication_artifact"] = publication_artifact
     if publication_artifact_hash is not None:
-        fresh.publication_artifact_hash = publication_artifact_hash
-        fresh.diff_hash = publication_artifact_hash
+        values["publication_artifact_hash"] = publication_artifact_hash
+        values["diff_hash"] = publication_artifact_hash
     if publication_artifact_size is not None:
-        fresh.publication_artifact_size = publication_artifact_size
+        values["publication_artifact_size"] = publication_artifact_size
     if publication_artifact_version is not None:
-        fresh.publication_artifact_version = publication_artifact_version
+        values["publication_artifact_version"] = publication_artifact_version
     if publication_change_manifest is not None:
-        fresh.publication_change_manifest = publication_change_manifest
+        values["publication_change_manifest"] = publication_change_manifest
     if publication_artifact_status is not None:
-        fresh.publication_artifact_status = publication_artifact_status
+        values["publication_artifact_status"] = publication_artifact_status
     if publication_artifact_error is not None:
-        fresh.publication_artifact_error = publication_artifact_error[:1024]
+        values["publication_artifact_error"] = publication_artifact_error[:1024]
     if validation_artifact_hash is not None:
-        fresh.validation_artifact_hash = validation_artifact_hash
-    fresh.finished_at = datetime.now(timezone.utc)
+        values["validation_artifact_hash"] = validation_artifact_hash
+    conditions = [AgentRun.id == run.id, ~AgentRun.status.in_(tuple(AGENT_TERMINAL))]
+    if delivery_claim is not None:
+        conditions.append(AgentRun.delivery_claim_token == delivery_claim.token)
+    if status in {AgentRunStatus.succeeded, AgentRunStatus.awaiting_approval}:
+        conditions.append(AgentRun.cancel_requested.is_(False))
+    changed = await db.execute(update(AgentRun).where(*conditions).values(**values))
+    if delivery_claim is not None and changed.rowcount != 1:
+        await db.rollback()
+        raise DeliveryClaimLost("agent completion claim lost")
     await db.commit()
 
 
@@ -145,14 +171,34 @@ async def _add_step(
     tool_input: dict | None,
     summary: str,
     duration_ms: int,
+    delivery_claim: DeliveryClaim | None = None,
 ) -> None:
-    run.steps_used += 1
-    if kind == "tool":
-        run.tool_calls_used += 1
+    if delivery_claim is None:
+        run.steps_used += 1
+        if kind == "tool":
+            run.tool_calls_used += 1
+        step_number = run.steps_used
+    else:
+        values = {"steps_used": AgentRun.steps_used + 1}
+        if kind == "tool":
+            values["tool_calls_used"] = AgentRun.tool_calls_used + 1
+        result = await db.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run.id, AgentRun.delivery_claim_token == delivery_claim.token)
+            .values(**values)
+            .returning(AgentRun.steps_used, AgentRun.tool_calls_used)
+        )
+        row = result.first()
+        if row is None:
+            await db.rollback()
+            raise DeliveryClaimLost("agent step claim lost")
+        step_number = row.steps_used
+        run.steps_used = step_number
+        run.tool_calls_used = row.tool_calls_used
     db.add(
         AgentStep(
             agent_run_id=run.id,
-            step_number=run.steps_used,
+            step_number=step_number,
             kind=kind,
             tool_name=tool_name,
             tool_input=tool_input,
@@ -163,7 +209,28 @@ async def _add_step(
     await db.commit()
 
 
-async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: LLMProvider | None = None) -> None:
+async def _set_agent_state(
+    db: AsyncSession,
+    run_id: UUID,
+    values: dict,
+    delivery_claim: DeliveryClaim | None,
+) -> None:
+    conditions = [AgentRun.id == run_id]
+    if delivery_claim is not None:
+        conditions.append(AgentRun.delivery_claim_token == delivery_claim.token)
+    changed = await db.execute(update(AgentRun).where(*conditions).values(**values))
+    if delivery_claim is not None and changed.rowcount != 1:
+        await db.rollback()
+        raise DeliveryClaimLost("agent state claim lost")
+    await db.commit()
+
+
+async def process_agent_run(
+    run_id: UUID,
+    provider: DockerSandboxProvider,
+    llm: LLMProvider | None = None,
+    delivery_claim: DeliveryClaim | None = None,
+) -> None:
     settings = get_settings()
     factory = get_session_factory()
     sandbox_id: str | None = None
@@ -177,14 +244,27 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
     from app.services.github_client import GitHubClient
 
     async with factory() as db:
-        run = await claim_agent_run(db, run_id)
+        run = await claim_agent_run(db, run_id, delivery_claim)
         if run is None:
             existing = await db.get(AgentRun, run_id)
-            if existing and existing.status == AgentRunStatus.queued and existing.cancel_requested:
-                existing.status = AgentRunStatus.cancelled
-                existing.error_type = AgentRunErrorType.cancelled
-                existing.error_message = "Cancelled before start"
-                existing.finished_at = datetime.now(timezone.utc)
+            if existing and existing.cancel_requested and existing.status in AGENT_ACTIVE:
+                cancel_conditions = [
+                    AgentRun.id == run_id,
+                    AgentRun.cancel_requested.is_(True),
+                    AgentRun.status.in_(tuple(AGENT_ACTIVE)),
+                ]
+                if delivery_claim is not None:
+                    cancel_conditions.append(AgentRun.delivery_claim_token == delivery_claim.token)
+                await db.execute(
+                    update(AgentRun)
+                    .where(*cancel_conditions)
+                    .values(
+                        status=AgentRunStatus.cancelled,
+                        error_type=AgentRunErrorType.cancelled,
+                        error_message="Cancelled before start",
+                        finished_at=datetime.now(timezone.utc),
+                    )
+                )
                 await db.commit()
                 await events.publish("agent.run.cancelled", {"status": "cancelled"})
             return
@@ -200,6 +280,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                     status=AgentRunStatus.failed,
                     error_type=AgentRunErrorType.not_configured,
                     error_message="Agent LLM is not configured",
+                    delivery_claim=delivery_claim,
                 )
                 await events.publish("agent.run.failed", {"status": "failed", "error": "not_configured"})
                 return
@@ -212,6 +293,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                     status=AgentRunStatus.failed,
                     error_type=AgentRunErrorType.repository_error,
                     error_message="Repository connection missing",
+                    delivery_claim=delivery_claim,
                 )
                 await events.publish("agent.run.failed", {"status": "failed", "error": "repository_error"})
                 return
@@ -254,8 +336,8 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
             base_sha = subprocess.run(
                 ["git", "rev-parse", "HEAD"], cwd=repo_path, check=True, capture_output=True, text=True
             ).stdout.strip()
-            run.base_commit_sha = base_sha
-            await db.commit()
+            await _set_agent_state(db, run.id, {"base_commit_sha": base_sha}, delivery_claim)
+            await db.refresh(run)
 
             sandbox_id = provider.create(
                 SandboxSpec(
@@ -267,9 +349,13 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                     network_disabled=settings.sandbox_network_disabled,
                 )
             )
-            run.sandbox_id = sandbox_id
-            run.status = AgentRunStatus.running
-            await db.commit()
+            await _set_agent_state(
+                db,
+                run.id,
+                {"sandbox_id": sandbox_id, "status": AgentRunStatus.running},
+                delivery_claim,
+            )
+            await db.refresh(run)
             await events.publish("agent.run.status", {"status": "running"})
             provider.put_directory(sandbox_id, str(repo_path), "/workspace")
 
@@ -299,7 +385,12 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                 await db.refresh(run)
                 if run.cancel_requested:
                     await finish_agent_run(
-                        db, run, status=AgentRunStatus.cancelled, error_type=AgentRunErrorType.cancelled, error_message="Cancelled"
+                        db,
+                        run,
+                        status=AgentRunStatus.cancelled,
+                        error_type=AgentRunErrorType.cancelled,
+                        error_message="Cancelled",
+                        delivery_claim=delivery_claim,
                     )
                     await events.publish("agent.run.cancelled", {"status": "cancelled"})
                     logger.info("agent.run.cancelled", agent_run_id=str(run.id))
@@ -311,6 +402,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                         status=AgentRunStatus.timed_out,
                         error_type=AgentRunErrorType.runtime_limit_reached,
                         error_message="Runtime limit reached",
+                        delivery_claim=delivery_claim,
                     )
                     await events.publish("agent.run.timed_out", {"status": "timed_out"})
                     return
@@ -321,6 +413,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                         status=AgentRunStatus.step_limit_reached,
                         error_type=AgentRunErrorType.step_limit_reached,
                         error_message="Step or tool-call limit reached",
+                        delivery_claim=delivery_claim,
                     )
                     await events.publish("agent.run.step_limit_reached", {"status": "step_limit_reached"})
                     return
@@ -342,6 +435,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                         status=AgentRunStatus.failed,
                         error_type=AgentRunErrorType.model_error,
                         error_message="Model provider error",
+                        delivery_claim=delivery_claim,
                     )
                     await events.publish("agent.run.failed", {"status": "failed", "error": "model_error"})
                     logger.warning("agent.model_error", agent_run_id=str(run.id), error=str(exc)[:200])
@@ -371,8 +465,8 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                         summary = str(call.arguments.get("summary") or "Done")
                         val_cmd = call.arguments.get("validation_command")
                         if isinstance(val_cmd, list) and val_cmd:
-                            run.status = AgentRunStatus.validating
-                            await db.commit()
+                            await _set_agent_state(db, run.id, {"status": AgentRunStatus.validating}, delivery_claim)
+                            await db.refresh(run)
                             await events.publish("agent.run.status", {"status": "validating"})
                             await events.publish(
                                 "agent.validation.started",
@@ -399,6 +493,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                             tool_input={"summary": summary},
                             summary=summary,
                             duration_ms=int((time.monotonic() - t0) * 1000),
+                            delivery_claim=delivery_claim,
                         )
                         await events.publish(
                             "agent.tool.completed",
@@ -441,6 +536,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                                 publication_artifact_size=exc.size,
                                 publication_artifact_status="too_large",
                                 publication_artifact_error="Publication artifact exceeds the configured size limit",
+                                delivery_claim=delivery_claim,
                             )
                             await events.publish("agent.run.failed", {"status": "failed", "error": "artifact_too_large"})
                             finished = True
@@ -457,6 +553,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                                 validation=validation,
                                 publication_artifact_status="invalid",
                                 publication_artifact_error="Publication artifact could not be captured safely",
+                                delivery_claim=delivery_claim,
                             )
                             await events.publish("agent.run.failed", {"status": "failed", "error": "artifact_capture_failed"})
                             finished = True
@@ -493,6 +590,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                             publication_change_manifest=artifact.manifest,
                             publication_artifact_status=artifact_status,
                             validation_artifact_hash=artifact.artifact_hash if ok else None,
+                            delivery_claim=delivery_claim,
                         )
                         await events.publish("agent.files.changed", {"files": artifact.manifest})
                         await events.publish(
@@ -535,6 +633,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                         tool_input={k: v for k, v in (call.arguments or {}).items() if k != "content" and k != "patch"},
                         summary=result.summary,
                         duration_ms=int((time.monotonic() - t0) * 1000),
+                        delivery_claim=delivery_claim,
                     )
                     await events.publish(
                         "agent.tool.completed",
@@ -558,8 +657,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                             path = parts[-1] if parts else line
                             changed.append({"path": path, "change_type": "modified"})
                         if changed:
-                            run.changed_files = changed[:200]
-                            await db.commit()
+                            await _set_agent_state(db, run.id, {"changed_files": changed[:200]}, delivery_claim)
                             await events.publish("agent.files.changed", {"files": changed[:50]})
                     messages.append(
                         {
@@ -598,6 +696,7 @@ async def process_agent_run(run_id: UUID, provider: DockerSandboxProvider, llm: 
                         status=AgentRunStatus.failed,
                         error_type=AgentRunErrorType.internal_error,
                         error_message=str(exc)[:500],
+                        delivery_claim=delivery_claim,
                     )
                     await events.publish("agent.run.failed", {"status": "failed", "error": "internal_error"})
         finally:

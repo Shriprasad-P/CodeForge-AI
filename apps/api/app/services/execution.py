@@ -14,7 +14,7 @@ from app.models.agent_session import AgentSession
 from app.models.execution import ACTIVE_STATUSES, ExecutionJob, ExecutionJobStatus
 from app.models.github import GitHubInstallation, RepositoryConnection
 from app.models.user import User
-from app.services.queue import enqueue_execution
+from app.services.outbox import EXECUTION_REQUESTED, add_outbox_event
 
 logger = get_logger(__name__)
 
@@ -105,9 +105,15 @@ async def create_execution_job(
         working_directory=working_directory,
     )
     db.add(job)
+    await db.flush()
+    add_outbox_event(
+        db,
+        event_type=EXECUTION_REQUESTED,
+        aggregate_id=job.id,
+        payload={"execution_id": str(job.id)},
+    )
     await db.commit()
     await db.refresh(job)
-    await enqueue_execution(job.id)
     logger.info("execution.queued", execution_id=str(job.id), user_id=str(user.id))
     return job
 

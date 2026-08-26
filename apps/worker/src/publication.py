@@ -13,7 +13,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -26,55 +26,22 @@ from app.models.agent_run import AgentRun, AgentRunErrorType, AgentRunStatus
 from app.models.github import GitHubInstallation, RepositoryConnection
 from app.services.agent_events import AgentEventPublisher
 from app.services.github_client import GitHubClient
-from app.services.queue import enqueue_publication
 from sandbox_sdk import SandboxSpec
 from sandbox_sdk.docker_provider import DockerSandboxProvider
 
 from src.agent.tools import AgentTools
 from src.artifacts import PUBLICATION_ARTIFACT_VERSION, ArtifactCaptureError, capture_publication_artifact
 from src.checkout import sanitize_text
+from src.delivery import DeliveryClaim, DeliveryClaimLost
 
 logger = get_logger(__name__)
 
 
 async def reconcile_pending_publications() -> None:
-    """Recover approved jobs after worker/Redis crashes.
+    """Compatibility wrapper for the shared PostgreSQL delivery reconciler."""
+    from src.delivery import reconcile_durable_delivery
 
-    PostgreSQL remains authoritative: an approved run is re-enqueued on worker
-    startup, while claims left in ``publishing`` are returned to the approved
-    state only after a bounded lease has expired.
-    """
-    factory = get_session_factory()
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
-    async with factory() as db:
-        stale = await db.execute(
-            select(AgentRun.id).where(
-                AgentRun.approval_status == "approved",
-                AgentRun.publication_status == "publishing",
-                AgentRun.updated_at < cutoff,
-            )
-        )
-        stale_ids = list(stale.scalars())
-        if stale_ids:
-            await db.execute(
-                update(AgentRun)
-                .where(AgentRun.id.in_(stale_ids))
-                .values(status=AgentRunStatus.awaiting_approval, publication_status="approved")
-            )
-        pending = await db.execute(
-            select(AgentRun.id).where(
-                AgentRun.approval_status == "approved",
-                AgentRun.publication_status.in_(["approved", "publication_failed"]),
-                AgentRun.status.in_([AgentRunStatus.awaiting_approval, AgentRunStatus.failed]),
-            )
-        )
-        pending_ids = list(pending.scalars())
-        await db.commit()
-    for publication_id in {*(stale_ids or []), *(pending_ids or [])}:
-        try:
-            await enqueue_publication(publication_id)
-        except Exception:  # noqa: BLE001
-            logger.warning("publication.requeue_failed", run_id=str(publication_id))
+    await reconcile_durable_delivery()
 
 
 def _git(repo: Path, args: list[str], *, check: bool = True, token: str | None = None) -> str:
@@ -158,24 +125,30 @@ def _validate_with_sandbox(provider: DockerSandboxProvider, repo: Path, run: Age
             provider.destroy_labeled(execution_id=f"publication-{run.id}")
 
 
-async def process_publication(run_id: UUID, provider: DockerSandboxProvider) -> None:
+async def process_publication(
+    run_id: UUID,
+    provider: DockerSandboxProvider,
+    delivery_claim: DeliveryClaim | None = None,
+) -> None:
     settings = get_settings()
     factory = get_session_factory()
     events = AgentEventPublisher(run_id)
-    claim_token = uuid4().hex
+    claim_token = delivery_claim.token if delivery_claim is not None else uuid4().hex
     work_dir = Path(tempfile.mkdtemp(prefix=f"agentdock-publication-{run_id}-"))
     token: str | None = None
     repo_path = work_dir / "repo"
     try:
         async with factory() as db:
+            claim_update = update(AgentRun).where(
+                AgentRun.id == run_id,
+                AgentRun.approval_status == "approved",
+                AgentRun.publication_status.in_(["approved", "publication_failed", "publishing"]),
+                AgentRun.status.in_([AgentRunStatus.awaiting_approval, AgentRunStatus.publishing, AgentRunStatus.failed]),
+            )
+            if delivery_claim is not None:
+                claim_update = claim_update.where(AgentRun.delivery_claim_token == delivery_claim.token)
             result = await db.execute(
-                update(AgentRun)
-                .where(
-                    AgentRun.id == run_id,
-                    AgentRun.approval_status == "approved",
-                    AgentRun.publication_status.in_(["approved", "publication_failed"]),
-                    AgentRun.status.in_([AgentRunStatus.awaiting_approval, AgentRunStatus.publishing, AgentRunStatus.failed]),
-                )
+                claim_update
                 .values(
                     status=AgentRunStatus.publishing,
                     publication_status="publishing",
@@ -224,18 +197,26 @@ async def process_publication(run_id: UUID, provider: DockerSandboxProvider) -> 
                 raise RuntimeError("approved artifact has no successful validation")
             approved_manifest = run.publication_change_manifest
             branch = run.branch_name or _safe_branch(run.id)
-            run.branch_name = branch
+            branch_update = update(AgentRun).where(AgentRun.id == run_id)
+            if delivery_claim is not None:
+                branch_update = branch_update.where(AgentRun.delivery_claim_token == delivery_claim.token)
+            changed = await db.execute(branch_update.values(branch_name=branch))
+            if delivery_claim is not None and changed.rowcount != 1:
+                await db.rollback()
+                raise DeliveryClaimLost("publication delivery claim lost")
             await db.commit()
 
         async def assert_claim() -> None:
             async with factory() as check_db:
+                claim_check = update(AgentRun).where(
+                    AgentRun.id == run_id,
+                    AgentRun.publication_status == "publishing",
+                    AgentRun.publication_claim_token == claim_token,
+                )
+                if delivery_claim is not None:
+                    claim_check = claim_check.where(AgentRun.delivery_claim_token == delivery_claim.token)
                 changed = await check_db.execute(
-                    update(AgentRun)
-                    .where(
-                        AgentRun.id == run_id,
-                        AgentRun.publication_status == "publishing",
-                        AgentRun.publication_claim_token == claim_token,
-                    )
+                    claim_check
                     .values(updated_at=datetime.now(timezone.utc))
                 )
                 await check_db.commit()
@@ -291,10 +272,11 @@ async def process_publication(run_id: UUID, provider: DockerSandboxProvider) -> 
         if not valid:
             raise RuntimeError(f"publication validation failed: {validation_output[:500]}")
 
-        existing_commit = None
-        if run.commit_sha:
-            _git(repo_path, ["fetch", "origin", f"{branch}:{branch}"], check=False)
-            existing_commit = _git(repo_path, ["rev-parse", "--verify", branch], check=False)
+        # Always inspect the remote branch. A worker can crash after the push
+        # succeeds but before commit_sha is persisted; retrying must adopt the
+        # already-pushed commit instead of creating a second branch history.
+        _git(repo_path, ["fetch", "origin", f"{branch}:{branch}"], check=False)
+        existing_commit = _git(repo_path, ["rev-parse", "--verify", branch], check=False)
         if existing_commit:
             if existing_commit != run.commit_sha:
                 raise RuntimeError("publication branch already points to a different commit")
@@ -315,9 +297,14 @@ async def process_publication(run_id: UUID, provider: DockerSandboxProvider) -> 
             commit_sha = _git(repo_path, ["rev-parse", "HEAD"])
         title = _safe_title(run.summary, run.id)
         async with factory() as db:
+            commit_update = update(AgentRun).where(
+                AgentRun.id == run_id,
+                AgentRun.publication_claim_token == claim_token,
+            )
+            if delivery_claim is not None:
+                commit_update = commit_update.where(AgentRun.delivery_claim_token == delivery_claim.token)
             changed = await db.execute(
-                update(AgentRun)
-                .where(AgentRun.id == run_id, AgentRun.publication_claim_token == claim_token)
+                commit_update
                 .values(commit_sha=commit_sha)
             )
             if changed.rowcount != 1:
@@ -356,12 +343,15 @@ async def process_publication(run_id: UUID, provider: DockerSandboxProvider) -> 
                     base=connection.default_branch,
                 )
         async with factory() as db:
+            final_update = update(AgentRun).where(AgentRun.id == run_id, AgentRun.publication_claim_token == claim_token)
+            if delivery_claim is not None:
+                final_update = final_update.where(AgentRun.delivery_claim_token == delivery_claim.token)
             changed = await db.execute(
-                update(AgentRun)
-                .where(AgentRun.id == run_id, AgentRun.publication_claim_token == claim_token)
+                final_update
                 .values(
                     status=AgentRunStatus.succeeded,
                     publication_status="published",
+                    delivery_claim_token=None,
                     publication_claim_token=None,
                     github_pr_id=int(pr.get("id")) if pr.get("id") else None,
                     github_pr_number=int(pr.get("number")) if pr.get("number") else None,
@@ -378,12 +368,15 @@ async def process_publication(run_id: UUID, provider: DockerSandboxProvider) -> 
         message = str(exc)[:1024]
         logger.warning("publication.failed", run_id=str(run_id), reason=sanitize_text(message, token))
         async with factory() as db:
+            failure_update = update(AgentRun).where(AgentRun.id == run_id, AgentRun.publication_claim_token == claim_token)
+            if delivery_claim is not None:
+                failure_update = failure_update.where(AgentRun.delivery_claim_token == delivery_claim.token)
             changed = await db.execute(
-                update(AgentRun)
-                .where(AgentRun.id == run_id, AgentRun.publication_claim_token == claim_token)
+                failure_update
                 .values(
                     status=AgentRunStatus.failed,
                     publication_status="publication_failed",
+                    delivery_claim_token=None,
                     publication_claim_token=None,
                     error_type=AgentRunErrorType.repository_changed if message == "repository_changed" else AgentRunErrorType.publication_failed,
                     error_message=sanitize_text(message, token),

@@ -42,7 +42,7 @@ async def app_client() -> AsyncIterator[AsyncClient]:
     async with factory() as session:
         await session.execute(
             text(
-                "TRUNCATE agent_steps, agent_runs, execution_jobs, github_webhook_deliveries, repository_connections, "
+                "TRUNCATE outbox_events, agent_steps, agent_runs, execution_jobs, github_webhook_deliveries, repository_connections, "
                 "github_installations, github_accounts, auth_sessions, agent_sessions, users "
                 "RESTART IDENTITY CASCADE"
             )

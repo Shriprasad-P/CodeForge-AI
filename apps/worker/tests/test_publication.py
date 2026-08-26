@@ -13,9 +13,12 @@ from app.db.redis import close_redis, init_redis
 from app.db.session import close_db, get_session_factory, init_db
 from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.github import GitHubInstallation, RepositoryConnection
+from app.models.outbox import OutboxEvent
 from app.models.user import User
 from sandbox_sdk.docker_provider import DockerSandboxProvider
 from src.artifacts import PUBLICATION_ARTIFACT_VERSION, capture_publication_artifact
+from src.delivery import process_outbox_event
+from app.services.outbox import PUBLICATION_REQUESTED, event_dedupe_key
 from src.publication import process_publication
 
 
@@ -115,13 +118,25 @@ async def test_publication_commits_pushes_and_is_idempotent(tmp_path: Path, monk
             validation={"command": None, "ok": True, "output": "No recorded validation command"},
         )
         session.add(run)
+        await session.flush()
+        event = OutboxEvent(
+            event_type=PUBLICATION_REQUESTED,
+            aggregate_id=run.id,
+            dedupe_key=event_dedupe_key(PUBLICATION_REQUESTED, run.id),
+            payload={"agent_run_id": str(run.id), "artifact_hash": artifact.artifact_hash},
+        )
+        session.add(event)
         await session.commit()
         run_id = run.id
+        event_id = event.id
 
-    await process_publication(run_id, DockerSandboxProvider())
+    await process_outbox_event(event_id, DockerSandboxProvider())
     async with factory() as session:
         published = await session.get(AgentRun, run_id)
+        delivery = await session.get(OutboxEvent, event_id)
         assert published is not None
+        assert delivery is not None
+        assert delivery.status == "processed"
         assert published.status == AgentRunStatus.succeeded
         assert published.publication_status == "published"
         assert published.commit_sha
@@ -136,7 +151,8 @@ async def test_publication_commits_pushes_and_is_idempotent(tmp_path: Path, monk
     ).stdout
     assert published.commit_sha in refs
 
-    # A duplicate queue delivery is a no-op after the durable published marker.
+    # A duplicate durable delivery is a no-op after the processed marker.
+    await process_outbox_event(event_id, DockerSandboxProvider())
     await process_publication(run_id, DockerSandboxProvider())
     async with factory() as session:
         duplicate = await session.scalar(select(AgentRun).where(AgentRun.id == run_id))

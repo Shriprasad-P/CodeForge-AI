@@ -9,6 +9,7 @@ from sqlalchemy import select
 from app.db.session import get_session_factory
 from app.models.execution import ExecutionJob, ExecutionJobStatus
 from app.models.github import GitHubInstallation, RepositoryConnection
+from app.models.outbox import OutboxEvent
 from app.models.user import User
 
 
@@ -70,6 +71,18 @@ async def test_create_list_get_execution(app_client: AsyncClient) -> None:
     assert body["status"] == "queued"
     assert body["command"] == ["python", "hello.py"]
     job_id = body["id"]
+
+    factory = get_session_factory()
+    async with factory() as session:
+        event = await session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.event_type == "execution.requested",
+                OutboxEvent.aggregate_id == job_id,
+            )
+        )
+        assert event is not None
+        assert event.status == "pending"
+        assert event.payload == {"execution_id": job_id}
 
     listed = await app_client.get("/api/executions")
     assert listed.status_code == 200

@@ -10,6 +10,7 @@ from sqlalchemy import select
 from app.db.session import get_session_factory
 from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.github import GitHubInstallation, RepositoryConnection
+from app.models.outbox import OutboxEvent
 from app.models.user import User
 
 
@@ -75,6 +76,18 @@ async def test_agent_status_and_create(app_client: AsyncClient) -> None:
     body = created.json()
     assert body["status"] == "queued"
     run_id = body["id"]
+
+    factory = get_session_factory()
+    async with factory() as session:
+        event = await session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.event_type == "agent_run.requested",
+                OutboxEvent.aggregate_id == run_id,
+            )
+        )
+        assert event is not None
+        assert event.status == "pending"
+        assert event.payload == {"agent_run_id": run_id}
 
     got = await app_client.get(f"/api/agent-runs/{run_id}")
     assert got.status_code == 200
@@ -171,6 +184,16 @@ async def test_agent_approval_is_owner_bound_and_idempotent(app_client: AsyncCli
     assert approved.status_code == 200, approved.text
     assert approved.json()["approval_status"] == "approved"
     assert approved.json()["publication_status"] == "approved"
+    async with factory() as session:
+        publication_event = await session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.event_type == "publication.requested",
+                OutboxEvent.aggregate_id == run_id,
+            )
+        )
+        assert publication_event is not None
+        assert publication_event.status == "pending"
+        assert publication_event.payload == {"agent_run_id": run_id, "artifact_hash": artifact_hash}
     duplicate = await app_client.post(
         f"/api/agent-runs/{run_id}/approve",
         json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "a" * 40},

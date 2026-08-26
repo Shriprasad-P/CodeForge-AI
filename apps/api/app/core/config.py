@@ -87,11 +87,19 @@ class Settings(BaseSettings):
     sandbox_checkout_mode: str = "fixture"
     sandbox_fixture_repo_path: str = ""
     execution_queue_key: str = "agentdock:executions"
+    outbox_queue_key: str = "agentdock:outbox"
     execution_rate_limit_attempts: int = 10
     execution_rate_limit_window_seconds: int = 60
     execution_max_active_per_user: int = 3
     worker_concurrency: int = 2
     worker_reconcile_stale_seconds: int = 900
+    outbox_dispatch_batch_size: int = 50
+    outbox_dispatch_lease_seconds: int = 30
+    outbox_worker_lease_seconds: int = 900
+    outbox_dispatch_visibility_seconds: int = 60
+    outbox_retry_backoff_seconds: int = 5
+    outbox_max_attempts: int = 8
+    outbox_reconcile_interval_seconds: int = 15
     # Command argv length / count bounds
     execution_max_command_args: int = 32
     execution_max_arg_length: int = 256

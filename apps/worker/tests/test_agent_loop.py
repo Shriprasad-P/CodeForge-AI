@@ -15,11 +15,14 @@ from app.db.redis import close_redis, init_redis
 from app.db.session import close_db, get_session_factory, init_db
 from app.models.agent_run import AgentRun, AgentRunStatus
 from app.models.github import GitHubInstallation, RepositoryConnection
+from app.models.outbox import OutboxEvent
 from app.models.user import User
+from app.services.outbox import AGENT_RUN_REQUESTED, event_dedupe_key
 from sandbox_sdk.docker_provider import DockerSandboxProvider, LABEL_SANDBOX
 from src.agent.llm import FakeLLMProvider
 from src.agent.loop import process_agent_run
 from src.agent.paths import PathEscapeError, safe_rel_path
+from src.delivery import process_outbox_event
 
 
 def _docker_available() -> bool:
@@ -112,15 +115,27 @@ async def test_deterministic_agent_e2e(image_ready: str, monkeypatch: pytest.Mon
             max_steps=20,
         )
         session.add(run)
+        await session.flush()
+        event = OutboxEvent(
+            event_type=AGENT_RUN_REQUESTED,
+            aggregate_id=run.id,
+            dedupe_key=event_dedupe_key(AGENT_RUN_REQUESTED, run.id),
+            payload={"agent_run_id": str(run.id)},
+        )
+        session.add(event)
         await session.commit()
         run_id = run.id
+        event_id = event.id
 
     provider = DockerSandboxProvider()
-    await process_agent_run(run_id, provider, llm=FakeLLMProvider())
+    await process_outbox_event(event_id, provider, llm=FakeLLMProvider())
 
     async with factory() as session:
         finished = await session.get(AgentRun, run_id)
+        delivery = await session.get(OutboxEvent, event_id)
         assert finished is not None
+        assert delivery is not None
+        assert delivery.status == "processed"
         assert finished.status == AgentRunStatus.awaiting_approval
         assert finished.approval_status == "pending"
         assert finished.base_commit_sha

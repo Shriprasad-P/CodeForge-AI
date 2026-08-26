@@ -131,6 +131,7 @@ class AgentRun(Base, TimestampMixin):
     approval_artifact_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     approval_base_commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     publication_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    delivery_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     publication_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     branch_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)

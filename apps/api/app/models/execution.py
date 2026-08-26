@@ -91,6 +91,7 @@ class ExecutionJob(Base, TimestampMixin):
     stderr: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     sandbox_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    delivery_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

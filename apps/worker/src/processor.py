@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import shutil
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -26,19 +25,30 @@ from sandbox_sdk import SandboxSpec
 from sandbox_sdk.docker_provider import DockerSandboxProvider
 
 from src.checkout import assert_remote_sanitized, clone_github_repo, prepare_fixture_checkout, sanitize_text
+from src.delivery import DeliveryClaim, DeliveryClaimLost
 
 logger = get_logger(__name__)
 
 
-async def claim_job(db: AsyncSession, job_id: UUID) -> ExecutionJob | None:
-    """Atomic claim: only queued jobs move to starting."""
+async def claim_job(
+    db: AsyncSession,
+    job_id: UUID,
+    delivery_claim: DeliveryClaim | None = None,
+) -> ExecutionJob | None:
+    """Atomically claim a queued or recoverable execution delivery."""
+    conditions = [ExecutionJob.id == job_id, ExecutionJob.cancel_requested.is_(False)]
+    if delivery_claim is None:
+        conditions.append(ExecutionJob.status == ExecutionJobStatus.queued)
+    else:
+        conditions.extend(
+            [
+                ExecutionJob.status.in_(tuple(ACTIVE_STATUSES)),
+                ExecutionJob.delivery_claim_token == delivery_claim.token,
+            ]
+        )
     result = await db.execute(
         update(ExecutionJob)
-        .where(
-            ExecutionJob.id == job_id,
-            ExecutionJob.status == ExecutionJobStatus.queued,
-            ExecutionJob.cancel_requested.is_(False),
-        )
+        .where(*conditions)
         .values(
             status=ExecutionJobStatus.starting,
             started_at=datetime.now(timezone.utc),
@@ -63,44 +73,91 @@ async def finish_job(
     stdout: str | None = None,
     stderr: str | None = None,
     truncated: bool = False,
+    delivery_claim: DeliveryClaim | None = None,
 ) -> None:
-    # Do not overwrite cancelled if cancel won the race after success path started writing.
+    # Do not overwrite cancellation, a terminal state, or a newer delivery claim.
     fresh = await db.get(ExecutionJob, job.id)
     if fresh is None:
         return
-    if fresh.status == ExecutionJobStatus.cancelled:
+    if delivery_claim is not None and fresh.delivery_claim_token != delivery_claim.token:
+        raise DeliveryClaimLost("execution delivery claim lost")
+    if fresh.status in TERMINAL_STATUSES:
         return
     if fresh.cancel_requested and status == ExecutionJobStatus.succeeded:
         status = ExecutionJobStatus.cancelled
         error_type = ExecutionErrorType.cancelled
         error_message = "Cancelled"
-    fresh.status = status
-    fresh.exit_code = exit_code
-    fresh.error_type = error_type
-    fresh.error_message = (error_message or "")[:1024] or None
-    fresh.stdout = stdout
-    fresh.stderr = stderr
-    fresh.output_truncated = truncated
-    fresh.finished_at = datetime.now(timezone.utc)
+    values = {
+        "status": status,
+        "exit_code": exit_code,
+        "error_type": error_type,
+        "error_message": (error_message or "")[:1024] or None,
+        "stdout": stdout,
+        "stderr": stderr,
+        "output_truncated": truncated,
+        "finished_at": datetime.now(timezone.utc),
+    }
+    conditions = [ExecutionJob.id == job.id, ~ExecutionJob.status.in_(tuple(TERMINAL_STATUSES))]
+    if delivery_claim is not None:
+        conditions.append(ExecutionJob.delivery_claim_token == delivery_claim.token)
+    if status == ExecutionJobStatus.succeeded:
+        conditions.append(ExecutionJob.cancel_requested.is_(False))
+    changed = await db.execute(update(ExecutionJob).where(*conditions).values(**values))
+    if delivery_claim is not None and changed.rowcount != 1:
+        await db.rollback()
+        raise DeliveryClaimLost("execution completion claim lost")
     await db.commit()
 
 
-async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
+async def _set_job_state(
+    db: AsyncSession,
+    job_id: UUID,
+    values: dict,
+    delivery_claim: DeliveryClaim | None,
+) -> None:
+    conditions = [ExecutionJob.id == job_id]
+    if delivery_claim is not None:
+        conditions.append(ExecutionJob.delivery_claim_token == delivery_claim.token)
+    changed = await db.execute(update(ExecutionJob).where(*conditions).values(**values))
+    if delivery_claim is not None and changed.rowcount != 1:
+        await db.rollback()
+        raise DeliveryClaimLost("execution state claim lost")
+    await db.commit()
+
+
+async def process_job(
+    job_id: UUID,
+    provider: DockerSandboxProvider,
+    delivery_claim: DeliveryClaim | None = None,
+) -> None:
     settings = get_settings()
     factory = get_session_factory()
     sandbox_id: str | None = None
     work_dir: Path | None = None
 
     async with factory() as db:
-        job = await claim_job(db, job_id)
+        job = await claim_job(db, job_id, delivery_claim)
         if job is None:
             # Duplicate delivery or already cancelled/terminal.
             existing = await db.get(ExecutionJob, job_id)
-            if existing and existing.status == ExecutionJobStatus.queued and existing.cancel_requested:
-                existing.status = ExecutionJobStatus.cancelled
-                existing.error_type = ExecutionErrorType.cancelled
-                existing.error_message = "Cancelled before start"
-                existing.finished_at = datetime.now(timezone.utc)
+            if existing and existing.cancel_requested and existing.status in ACTIVE_STATUSES:
+                cancel_conditions = [
+                    ExecutionJob.id == job_id,
+                    ExecutionJob.cancel_requested.is_(True),
+                    ExecutionJob.status.in_(tuple(ACTIVE_STATUSES)),
+                ]
+                if delivery_claim is not None:
+                    cancel_conditions.append(ExecutionJob.delivery_claim_token == delivery_claim.token)
+                await db.execute(
+                    update(ExecutionJob)
+                    .where(*cancel_conditions)
+                    .values(
+                        status=ExecutionJobStatus.cancelled,
+                        error_type=ExecutionErrorType.cancelled,
+                        error_message="Cancelled before start",
+                        finished_at=datetime.now(timezone.utc),
+                    )
+                )
                 await db.commit()
             logger.info("execution.skip", execution_id=str(job_id))
             return
@@ -116,6 +173,7 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
                     status=ExecutionJobStatus.cancelled,
                     error_type=ExecutionErrorType.cancelled,
                     error_message="Cancelled",
+                    delivery_claim=delivery_claim,
                 )
                 return
 
@@ -127,11 +185,12 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
                     status=ExecutionJobStatus.failed,
                     error_type=ExecutionErrorType.invalid_request,
                     error_message="Repository connection missing",
+                    delivery_claim=delivery_claim,
                 )
                 return
 
-            job.status = ExecutionJobStatus.cloning
-            await db.commit()
+            await _set_job_state(db, job.id, {"status": ExecutionJobStatus.cloning}, delivery_claim)
+            await db.refresh(job)
             logger.info("execution.clone_started", execution_id=str(job.id))
 
             work_dir = Path(tempfile.mkdtemp(prefix=f"agentdock-job-{job.id}-"))
@@ -169,6 +228,7 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
                     status=ExecutionJobStatus.cancelled,
                     error_type=ExecutionErrorType.cancelled,
                     error_message="Cancelled",
+                    delivery_claim=delivery_claim,
                 )
                 return
 
@@ -192,12 +252,17 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
                     status=ExecutionJobStatus.failed,
                     error_type=ExecutionErrorType.sandbox_start_failed,
                     error_message="Failed to start sandbox",
+                    delivery_claim=delivery_claim,
                 )
                 raise exc
 
-            job.sandbox_id = sandbox_id
-            job.status = ExecutionJobStatus.running
-            await db.commit()
+            await _set_job_state(
+                db,
+                job.id,
+                {"sandbox_id": sandbox_id, "status": ExecutionJobStatus.running},
+                delivery_claim,
+            )
+            await db.refresh(job)
             logger.info("sandbox.created", execution_id=str(job.id), sandbox_id=sandbox_id[:12])
             logger.info("execution.running", execution_id=str(job.id))
 
@@ -229,6 +294,7 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
                     stdout=stdout,
                     stderr=stderr,
                     truncated=result.truncated,
+                    delivery_claim=delivery_claim,
                 )
                 logger.info("execution.timed_out", execution_id=str(job.id))
             elif job.cancel_requested:
@@ -242,6 +308,7 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
                     stdout=stdout,
                     stderr=stderr,
                     truncated=result.truncated,
+                    delivery_claim=delivery_claim,
                 )
                 logger.info("execution.cancelled", execution_id=str(job.id))
             elif result.exit_code == 0:
@@ -253,6 +320,7 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
                     stdout=stdout,
                     stderr=stderr,
                     truncated=result.truncated,
+                    delivery_claim=delivery_claim,
                 )
                 logger.info("execution.succeeded", execution_id=str(job.id))
             else:
@@ -266,6 +334,7 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
                     stdout=stdout,
                     stderr=stderr,
                     truncated=result.truncated,
+                    delivery_claim=delivery_claim,
                 )
                 logger.info("execution.failed", execution_id=str(job.id), exit_code=result.exit_code)
         except Exception as exc:
@@ -283,6 +352,7 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
                         status=ExecutionJobStatus.failed,
                         error_type=err_type,
                         error_message=message or "Internal error",
+                        delivery_claim=delivery_claim,
                     )
         finally:
             if sandbox_id:
@@ -294,23 +364,7 @@ async def process_job(job_id: UUID, provider: DockerSandboxProvider) -> None:
 
 
 async def reconcile_stale_jobs(provider: DockerSandboxProvider) -> None:
-    settings = get_settings()
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=settings.worker_reconcile_stale_seconds)
-    factory = get_session_factory()
-    async with factory() as db:
-        rows = await db.scalars(
-            select(ExecutionJob).where(
-                ExecutionJob.status.in_(tuple(ACTIVE_STATUSES - {ExecutionJobStatus.queued})),
-                ExecutionJob.updated_at < cutoff,
-            )
-        )
-        for job in rows:
-            logger.warning("execution.reconcile_stale", execution_id=str(job.id), status=job.status.value)
-            if job.sandbox_id:
-                provider.destroy(job.sandbox_id)
-            provider.destroy_labeled(execution_id=str(job.id))
-            job.status = ExecutionJobStatus.failed
-            job.error_type = ExecutionErrorType.internal_error
-            job.error_message = "Interrupted (worker reconciliation)"
-            job.finished_at = datetime.now(timezone.utc)
-        await db.commit()
+    # PostgreSQL outbox reconciliation, rather than terminalizing recoverable work.
+    from src.delivery import reconcile_durable_delivery
+
+    await reconcile_durable_delivery()

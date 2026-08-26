@@ -22,7 +22,7 @@ from app.models.agent_run import (
 from app.models.agent_session import AgentSession
 from app.models.github import GitHubInstallation, RepositoryConnection
 from app.models.user import User
-from app.services.queue import enqueue_agent_run, enqueue_publication
+from app.services.outbox import AGENT_RUN_REQUESTED, PUBLICATION_REQUESTED, add_outbox_event
 
 logger = get_logger(__name__)
 
@@ -113,9 +113,15 @@ async def create_agent_run(
         max_steps=settings.agent_max_steps,
     )
     db.add(run)
+    await db.flush()
+    add_outbox_event(
+        db,
+        event_type=AGENT_RUN_REQUESTED,
+        aggregate_id=run.id,
+        payload={"agent_run_id": str(run.id)},
+    )
     await db.commit()
     await db.refresh(run)
-    await enqueue_agent_run(run.id)
     logger.info("agent.run.queued", agent_run_id=str(run.id), user_id=str(user.id))
     try:
         from app.services.agent_events import publish_agent_event
@@ -263,17 +269,13 @@ async def approve_agent_run(
     if changed.rowcount != 1:
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run approval is already being processed")
+    add_outbox_event(
+        db,
+        event_type=PUBLICATION_REQUESTED,
+        aggregate_id=run_id,
+        payload={"agent_run_id": str(run_id), "artifact_hash": persisted_hash},
+    )
     await db.commit()
-    try:
-        await enqueue_publication(run_id)
-    except Exception as exc:  # noqa: BLE001
-        # The approval is durable in PostgreSQL. A worker startup reconciler
-        # will requeue it, so Redis loss cannot silently lose publication.
-        logger.error("agent.publication_enqueue_failed", agent_run_id=str(run_id), error=str(exc)[:200])
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Publication queued durably; retry shortly",
-        ) from None
     from app.services.agent_events import publish_agent_event
 
     await publish_agent_event(run_id, "agent.approved", {"publication_status": "approved"})

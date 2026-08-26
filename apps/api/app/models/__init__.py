@@ -10,6 +10,7 @@ from app.models.github import (
     RepositoryConnection,
 )
 from app.models.user import User
+from app.models.outbox import OutboxEvent
 
 __all__ = [
     "AgentRun",
@@ -23,6 +24,7 @@ __all__ = [
     "ExecutionErrorType",
     "ExecutionJob",
     "ExecutionJobStatus",
+    "OutboxEvent",
     "GitHubAccount",
     "GitHubInstallation",
     "GitHubWebhookDelivery",
