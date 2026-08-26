@@ -1,191 +1,129 @@
 # AgentDock
 
-> **Product name:** AgentDock · **GitHub repository:** [CodeForge-AI](https://github.com/Shriprasad-P/CodeForge-AI)
+**Secure AI coding-agent infrastructure with isolated execution and human-approved GitHub publication.**
 
-Secure cloud coding-agent platform. Users connect a GitHub App, pick a repository, describe a task, and an AI agent works inside an isolated sandbox — then opens a pull request after approval.
+AgentDock (the GitHub repository is [CodeForge-AI](https://github.com/Shriprasad-P/CodeForge-AI)) turns a focused coding task into an inspectable pull request. A worker gives a bounded agent a fresh Docker sandbox to inspect, edit, and validate a checkout. The browser receives live operational activity and a bounded diff preview. A human reviews the immutable artifact before a trusted service creates a branch, one commit, and one pull request.
 
-> Phase 7 status: Phase 1–6 preserved + owner-approved, integrity-checked Git publication.
+## What it does
 
-![AgentDock status panel](docs/assets/screenshot-placeholder.svg)
+1. Connect a GitHub App installation and select a repository.
+2. Describe one bounded coding task.
+3. Let the worker inspect, edit, and validate inside an ephemeral sandbox.
+4. Watch durable status and operational activity in the workspace.
+5. Review the exact changed-file summary, diff preview, validation result, and artifact hash.
+6. Approve or reject publication explicitly.
+7. On approval, publish from a fresh checkout and open one pull request.
+
+AgentDock is deliberately human-approved infrastructure, not an unattended autonomous coding bot.
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) and [docs/adr/0001-architecture.md](docs/adr/0001-architecture.md).
-
-```text
-CodeForge-AI/                 # git repo (product: AgentDock)
-├── apps/
-│   ├── web/          # Next.js (App Router)
-│   ├── api/          # FastAPI + Alembic
-│   ├── agent/        # LLM agent (Phase 5)
-│   └── worker/       # Job worker (Phase 4+)
-├── packages/         # shared-types, agent-tools, sandbox-sdk, github-client
-├── infrastructure/
-├── tests/
-├── docs/
-├── docker-compose.yml
-└── .env.example
+```mermaid
+flowchart TD
+    B[Browser] --> W[Next.js Web]
+    W --> A[FastAPI API]
+    A --> PG[(PostgreSQL\nworkflow truth)]
+    A --> R[(Redis\nqueue + realtime)]
+    A --> GH[GitHub App]
+    A --> O[Durable outbox]
+    O --> WK[Worker]
+    WK --> SP[Sandbox provider]
+    SP --> D[Ephemeral Docker sandbox]
+    D -. bounded tools only .-> AG[Agent loop]
+    A --> AP[Human approval]
+    AP --> PUB[Trusted publication worker]
+    PUB --> FC[Fresh checkout]
+    FC --> VERIFY[Verify immutable artifact]
+    VERIFY --> GIT[Branch / commit / push]
+    GIT --> PR[Pull request]
+    GH -. credentials stay in control plane .-> PUB
 ```
 
-Internal identifiers (`agentdock-*` containers, `agentdock_*` metrics, DB user/db name) use the product name **AgentDock**.
+The browser, API, PostgreSQL, Redis, GitHub App, and worker are control-plane services. Sandboxes are ephemeral execution boundaries: they receive only a materialized checkout and bounded tool inputs. They do not receive GitHub App keys, database or Redis credentials, session secrets, or LLM keys, and they never receive the Docker socket.
 
-## Authentication (Phase 2)
+## Core engineering properties
 
-- Email/password registration and login
-- Passwords hashed with **Argon2id**
-- Auth sessions stored in Postgres (`auth_sessions`); only a **SHA-256 hash** of the cookie token is persisted
-- Browser session via **HttpOnly** cookie `agentdock_session` (`SameSite=Lax`; `Secure` auto-enabled outside development)
-- Redis fixed-window rate limit on `/api/auth/login` and `/api/auth/register`
-- Minimal `agent_sessions` table for ownership foundations (no agent execution yet)
+- **Isolated execution:** non-root, short-lived Docker sandboxes with network disabled by default and no host socket.
+- **Bounded tools:** path-safe file operations and argv-based commands; arbitrary shell strings are not accepted.
+- **Immutable review:** the server stores a SHA-256-addressed publication artifact and verifies its version, hash, and base commit at approval and publication time.
+- **Human-approved publication:** the agent cannot push directly; a trusted worker publishes only after owner approval.
+- **PostgreSQL-authoritative state:** Redis queues, locks, and Pub/Sub support delivery and realtime but are not workflow truth.
+- **Durable recovery:** an outbox, leases, idempotency keys, cancellation boundaries, and repository revocation fencing make retries explicit.
+- **Realtime recovery:** authenticated WebSocket activity has sequence checks, reconnect backoff, REST resynchronization, and polling fallback.
+- **Observable workflow:** request and workflow correlation, worker freshness, structured event fields, readiness checks, and metrics support diagnosis.
 
-## GitHub App (Phase 3)
+Source-backed details live in [docs/architecture.md](docs/architecture.md), [docs/security.md](docs/security.md), [docs/sandbox.md](docs/sandbox.md), [docs/publication.md](docs/publication.md), [docs/realtime.md](docs/realtime.md), and [docs/operations.md](docs/operations.md).
 
-- Link GitHub identity to an existing AgentDock user (does not create duplicate users)
-- Install the App on personal accounts or organizations
-- Discover repositories via **installation tokens** (temporary, server-side only)
-- Persist selected `repository_connections` by GitHub repository ID
-- Webhooks: `installation`, `installation_repositories` with signature verification
-- Without GitHub env vars the stack still starts; UI shows integration not configured
+## Deterministic demo
 
-Setup guide: [docs/github-app.md](docs/github-app.md).
+The repository includes a small fixture and a deterministic fake LLM for a repeatable local demonstration. Use the task **“Add request validation to the `/users` endpoint and add tests.”** The golden path exercises real PostgreSQL, Redis, Docker, a local Git remote, and a GitHub API stub:
 
-## Sandbox executions (Phase 4)
+`task → durable delivery → worker → sandbox → modification → validation → immutable artifact → approval → fresh-checkout publication → one commit → one PR request → succeeded`
 
-- Create execution jobs for **owned** repository connections
-- Worker claims jobs from a Redis queue and runs them in labelled ephemeral containers
-- Repository materialization on the worker host (fixture mode by default; GitHub clone when configured)
-- Argv-only commands inside the sandbox (no shell); bounded logs; cancel + timeout
-- See [docs/sandbox.md](docs/sandbox.md)
+The full-system harness is opt-in and documented with the worker tests. It does not fabricate a production GitHub outcome.
 
-## Coding agent (Phase 5)
-
-- Bounded inspect → edit → validate loop via tools in the sandbox
-- Providers: `fake` (CI/local) or `openai`
-- Soft-disables when LLM is unset; platform still boots
-- See [docs/agent.md](docs/agent.md)
-
-## Real-time workspace (Phase 6)
-
-- Authenticated WebSocket `/ws/agent-runs/{run_id}` (session cookie + ownership)
-- Redis Pub/Sub bridge; Postgres remains authoritative
-- Live status, tool activity, incremental command output, diff-ready notifications
-- Reconnect + REST recovery; polling fallback
-- See [docs/realtime.md](docs/realtime.md)
-
-## Quick start (local)
+## Local development
 
 ### Prerequisites
 
-- Docker Desktop / Docker Engine + Compose
-- Python **3.12 or 3.13** (bare `python3` may be 3.14 — not supported yet)
-- Node.js **22+**
+- Docker Desktop / Docker Engine with Compose
+- Python 3.12 or 3.13
+- Node.js 22+
 
-### 1. Environment
+### Start the control plane
 
 ```bash
 cp .env.example .env
-```
-
-Postgres host port **5433**, Redis **6380** by default (avoids clashes with local 5432/6379).
-
-GitHub App variables are optional for boot. Add them when testing connect/install (see [docs/github-app.md](docs/github-app.md)).
-
-### 2. Infrastructure only
-
-```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis
 ```
 
-### 3. API
+Run the API and web app using the instructions in [docs/operations.md](docs/operations.md), or start the complete local stack:
 
 ```bash
-cd apps/api
-python3.13 -m venv .venv   # or python3.12
-source .venv/bin/activate
-pip install -r requirements.txt
-alembic upgrade head
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-Compose runs `alembic upgrade head` in the API entrypoint before uvicorn.
-
-Verify:
-
-```bash
-curl -s http://localhost:8000/api/health | jq
-curl -s http://localhost:8000/api/ready | jq
-curl -s -c /tmp/ad.ck -X POST http://localhost:8000/api/auth/register \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"ada@example.com","password":"password123","display_name":"Ada"}' | jq
-curl -s -b /tmp/ad.ck http://localhost:8000/api/auth/me | jq
-curl -s -b /tmp/ad.ck http://localhost:8000/api/github/status | jq
-```
-
-### 4. Web
-
-```bash
-cd apps/web
-npm ci
-npm run dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) → Register / Login → Dashboard → Manage GitHub.
-
-### Full stack via Compose
-
-```bash
-cp .env.example .env
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-- Web: http://localhost:3000
-- API docs: http://localhost:8000/docs
+Open [http://localhost:3000](http://localhost:3000) and follow **Register → Connect GitHub → Coding agent**. GitHub and LLM configuration are optional capabilities; local deterministic runs use `LLM_PROVIDER=fake`.
 
-## Tests
+## Testing
 
 ```bash
-# API (requires Postgres + Redis; Compose infra is fine)
-cd apps/api && source .venv/bin/activate && alembic upgrade head && pytest -q
+# API
+cd apps/api && source .venv/bin/activate && pytest -q
 
-# Worker / sandbox (requires Docker daemon + sandbox image)
-docker build -t agentdock-sandbox:local -f infrastructure/sandbox/Dockerfile infrastructure/sandbox
-cd apps/worker && pip install -r ../api/requirements.txt -r requirements.txt -e ../../packages/sandbox-sdk && pytest -q
+# Worker and sandbox
+cd apps/worker && pytest -q
 
 # Web
-cd apps/web && npm ci && npm test && npm run lint && npm run build
+cd apps/web && npm test && npx tsc --noEmit && npm run lint && npm run build
 ```
 
-## Phase 3 limitations
+The Stage 6 baseline verified 90 API tests, 54 worker tests with 1 Docker-gated skip, 28 frontend tests, and a deterministic golden-path E2E using real PostgreSQL, Redis, and Docker. Re-run the commands above before treating those counts as current.
 
-Working: Phase 1 health stack, Phase 2 auth, GitHub App OAuth/link, installations, repository discovery/connections, webhooks, `/github` UI.
+## Current limitations
 
-## Phase 4 limitations
+- A live GitHub installation and pull-request run requires local App credentials; CI uses a GitHub API stub.
+- A hosted LLM provider is optional; the fake provider is the deterministic local path.
+- The default Compose profile is intentionally a single API/worker replica; multi-replica WebSocket soak testing remains an operational follow-up.
+- Diff previews are bounded for browser safety; the complete immutable artifact remains server-side for publication.
 
-Working: execution jobs, worker queue, Docker sandbox isolation, fixture checkout, constrained commands, logs/cancel/timeout, `/executions` UI.
+## Documentation
 
-## Phase 5 limitations
+- [Architecture](docs/architecture.md) · [Security](docs/security.md) · [Sandbox](docs/sandbox.md)
+- [GitHub App setup](docs/github-app.md) · [Publication](docs/publication.md) · [Realtime](docs/realtime.md)
+- [Operations](docs/operations.md) · [Testing](docs/test-plan.md) · [Demo and screenshots](docs/demo.md) · [Development history](docs/development-history.md)
 
-Working: agent runs/steps, FakeLLM deterministic loop, OpenAI provider hook, tool security, `/agent` UI.
+## Portfolio copy
 
-Working: approval-gated commit/push/PR publication and the Phase 6 WebSocket workspace.
+**AgentDock — Secure AI coding-agent infrastructure with isolated execution and human-approved GitHub publication.**
 
-## Phase roadmap
+AgentDock solves the trust gap between “ask an AI to change a repository” and “merge the resulting code.” It combines a FastAPI control plane, PostgreSQL-authoritative workflow state, Redis delivery and realtime recovery, a bounded agent loop, and ephemeral Docker sandboxes. Every change becomes an immutable, integrity-checked artifact; an owner must review and approve it before a trusted worker publishes one branch, one commit, and one pull request.
 
-| Phase | Deliverable |
-|-------|-------------|
-| 1 | Monorepo, Compose, health endpoints, landing page |
-| 2 | Auth, models, sessions |
-| 3 | GitHub App + repository connections |
-| 4 | Secure sandbox runtime + worker execution |
-| 5 | Coding agent state machine + tools |
-| 6 | WebSocket workspace UI |
-| 7 | Diff, approval, trusted commit/push, PR |
-| 8 | Playwright browser tools |
-| 9 | Observability + E2E |
+## GitHub presentation recommendations
 
-## Security
-
-See [docs/security.md](docs/security.md). Sandboxes must never receive GitHub App private keys, DB credentials, Redis secrets, or LLM API keys.
+- **Suggested repository description:** Secure AI coding-agent platform with sandboxed execution, immutable diff review, and human-approved GitHub publication.
+- **Suggested topics:** `ai-agents`, `coding-agent`, `developer-tools`, `fastapi`, `nextjs`, `postgresql`, `redis`, `docker`, `github-app`, `agentic-ai`.
+- **Homepage:** no deployed demo URL is claimed; use the repository until a real hosted environment exists.
 
 ## License
 

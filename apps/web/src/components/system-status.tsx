@@ -10,7 +10,7 @@ function StatusDot({ ok }: { ok: boolean | undefined }) {
   return (
     <span
       className={`inline-block h-2.5 w-2.5 rounded-full ${color}`}
-      aria-hidden
+      aria-hidden="true"
     />
   );
 }
@@ -55,7 +55,7 @@ export function SystemStatus() {
         System status
       </h2>
       <p className="mt-1 text-sm text-muted">
-        Live checks against the AgentDock API (Phase 1).
+        Live control-plane checks. Workflow state remains authoritative in PostgreSQL.
       </p>
 
       <ul className="mt-4 space-y-3 font-mono text-sm">

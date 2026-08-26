@@ -87,7 +87,9 @@ async def test_agent_status_and_create(app_client: AsyncClient) -> None:
         )
         assert event is not None
         assert event.status == "pending"
-        assert event.payload == {"agent_run_id": run_id}
+        assert event.payload["agent_run_id"] == run_id
+        assert event.payload["workflow_correlation_id"]
+        assert event.payload["request_id"]
 
     got = await app_client.get(f"/api/agent-runs/{run_id}")
     assert got.status_code == 200
@@ -193,7 +195,10 @@ async def test_agent_approval_is_owner_bound_and_idempotent(app_client: AsyncCli
         )
         assert publication_event is not None
         assert publication_event.status == "pending"
-        assert publication_event.payload == {"agent_run_id": run_id, "artifact_hash": artifact_hash}
+        assert publication_event.payload["agent_run_id"] == run_id
+        assert publication_event.payload["artifact_hash"] == artifact_hash
+        assert publication_event.payload["workflow_correlation_id"]
+        assert publication_event.payload["request_id"]
     duplicate = await app_client.post(
         f"/api/agent-runs/{run_id}/approve",
         json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "a" * 40},
@@ -286,3 +291,61 @@ async def test_malformed_manifest_cannot_be_approved(app_client: AsyncClient) ->
         json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "e" * 40},
     )
     assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_agent_approval_rejects_cancellation_and_invalid_validation(app_client: AsyncClient) -> None:
+    email = f"approval-fence-{uuid4().hex[:8]}@example.com"
+    await _register(app_client, email)
+    connection_id = await _seed_connection(email)
+    created = await app_client.post(
+        "/api/agent-runs",
+        json={"repository_connection_id": connection_id, "task": "Fence approval."},
+    )
+    run_id = created.json()["id"]
+    artifact = b"safe patch"
+    artifact_hash = hashlib.sha256(artifact).hexdigest()
+    factory = get_session_factory()
+    async with factory() as session:
+        run = await session.get(AgentRun, run_id)
+        assert run is not None
+        run.status = AgentRunStatus.awaiting_approval
+        run.base_commit_sha = "f" * 40
+        run.publication_artifact = artifact
+        run.publication_artifact_hash = artifact_hash
+        run.publication_artifact_size = len(artifact)
+        run.publication_artifact_version = 1
+        run.publication_change_manifest = [{"path": "README.md", "change_type": "modified"}]
+        run.publication_artifact_status = "ready"
+        run.diff_hash = artifact_hash
+        run.validation = {"command": ["pytest"], "ok": True}
+        run.validation_artifact_hash = artifact_hash
+        run.cancel_requested = True
+        await session.commit()
+    cancelled = await app_client.post(
+        f"/api/agent-runs/{run_id}/approve",
+        json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "f" * 40},
+    )
+    assert cancelled.status_code == 409
+    async with factory() as session:
+        run = await session.get(AgentRun, run_id)
+        assert run is not None
+        run.cancel_requested = False
+        run.validation = None
+        await session.commit()
+    missing = await app_client.post(
+        f"/api/agent-runs/{run_id}/approve",
+        json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "f" * 40},
+    )
+    assert missing.status_code == 409
+    async with factory() as session:
+        run = await session.get(AgentRun, run_id)
+        assert run is not None
+        run.validation = {"command": ["pytest"], "ok": False}
+        run.validation_artifact_hash = artifact_hash
+        await session.commit()
+    failed = await app_client.post(
+        f"/api/agent-runs/{run_id}/approve",
+        json={"artifact_hash": artifact_hash, "artifact_version": 1, "base_commit_sha": "f" * 40},
+    )
+    assert failed.status_code == 409

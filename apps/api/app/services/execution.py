@@ -9,9 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.observability import current_request_id, new_workflow_correlation_id
+from app.core.observability import metrics, persist_metric
 from app.db.redis import get_redis
 from app.models.agent_session import AgentSession
-from app.models.execution import ACTIVE_STATUSES, ExecutionJob, ExecutionJobStatus
+from app.models.execution import ACTIVE_STATUSES, TERMINAL_STATUSES, ExecutionJob, ExecutionJobStatus
 from app.models.github import GitHubInstallation, RepositoryConnection
 from app.models.user import User
 from app.services.outbox import EXECUTION_REQUESTED, add_outbox_event
@@ -75,7 +77,7 @@ async def create_execution_job(
     installation = await db.get(GitHubInstallation, connection.installation_id)
     if installation is None or installation.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repository connection not found")
-    if installation.suspended_at is not None and settings.sandbox_checkout_mode == "github":
+    if installation.suspended_at is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="GitHub installation is suspended")
 
     if agent_session_id is not None:
@@ -103,6 +105,7 @@ async def create_execution_job(
         status=ExecutionJobStatus.queued,
         command=list(command),
         working_directory=working_directory,
+        workflow_correlation_id=new_workflow_correlation_id(),
     )
     db.add(job)
     await db.flush()
@@ -111,10 +114,18 @@ async def create_execution_job(
         event_type=EXECUTION_REQUESTED,
         aggregate_id=job.id,
         payload={"execution_id": str(job.id)},
+        workflow_correlation_id=job.workflow_correlation_id,
+        request_id=current_request_id(),
     )
     await db.commit()
     await db.refresh(job)
-    logger.info("execution.queued", execution_id=str(job.id), user_id=str(user.id))
+    logger.info(
+        "execution.queued",
+        execution_job_id=str(job.id),
+        repository_connection_id=str(job.repository_connection_id),
+        workflow_correlation_id=str(job.workflow_correlation_id),
+        user_id=str(user.id),
+    )
     return job
 
 
@@ -149,17 +160,14 @@ async def request_cancel(db: AsyncSession, *, user_id: UUID, job_id: UUID) -> Ex
         job.finished_at = datetime.now(timezone.utc)
         await db.commit()
         await db.refresh(job)
-        logger.info("execution.cancelled", execution_id=str(job.id), phase="queued")
+        logger.info("execution.cancelled", execution_job_id=str(job.id), phase="queued", state_to="cancelled")
+        metrics.inc("agentdock_executions_cancelled_total")
+        await persist_metric("agentdock_executions_cancelled_total")
         return job
-    if job.status in {
-        ExecutionJobStatus.succeeded,
-        ExecutionJobStatus.failed,
-        ExecutionJobStatus.cancelled,
-        ExecutionJobStatus.timed_out,
-    }:
+    if job.status in TERMINAL_STATUSES:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Execution already finished")
     job.cancel_requested = True
     await db.commit()
     await db.refresh(job)
-    logger.info("execution.cancel_requested", execution_id=str(job.id))
+    logger.info("execution.cancel_requested", execution_job_id=str(job.id))
     return job

@@ -13,6 +13,7 @@ class ExecResult:
     stderr: bytes
     timed_out: bool = False
     truncated: bool = False
+    cancelled: bool = False
 
 
 @dataclass
@@ -47,6 +48,7 @@ class SandboxProvider(Protocol):
         timeout_seconds: float,
         max_output_bytes: int,
         on_chunk=None,
+        cancel_event=None,
     ) -> ExecResult:
         """Run argv (no shell) inside the sandbox."""
 

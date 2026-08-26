@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6380/0"
 
     ready_timeout_seconds: float = 2.0
+    # Worker freshness is optional for API-only development, but can be made
+    # a production readiness requirement explicitly.
+    worker_readiness_required: bool = False
+    worker_heartbeat_ttl_seconds: int = 30
+    worker_heartbeat_interval_seconds: int = 10
+    expected_alembic_revision: str = "0010_normalize_unique_indexes"
 
     # Auth (Phase 2) — SESSION_SECRET is only for future signed payloads; sessions use hashed tokens.
     session_secret: str = DEFAULT_SESSION_SECRET
@@ -114,6 +120,7 @@ class Settings(BaseSettings):
     agent_max_steps: int = 20
     agent_max_tool_calls: int = 40
     agent_max_runtime_seconds: int = 600
+    agent_tool_timeout_seconds: int = 120
     agent_max_context_chars: int = 48_000
     agent_max_file_read_bytes: int = 64_000
     agent_max_search_results: int = 40
@@ -129,6 +136,10 @@ class Settings(BaseSettings):
     ws_max_connections_per_user: int = 10
     ws_max_connections_per_run: int = 5
     ws_command_chunk_chars: int = 512
+    ws_slot_ttl_seconds: int = 3600
+    ws_slot_renew_interval_seconds: int = 300
+    ws_session_revalidate_seconds: int = 1
+    ws_max_reconnect_attempts: int = 8
 
     # Phase 7 publication. The test remote is only honored in local/test mode.
     git_author_name: str = "AgentDock"

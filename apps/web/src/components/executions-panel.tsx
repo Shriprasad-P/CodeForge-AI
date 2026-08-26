@@ -145,8 +145,8 @@ export function ExecutionsPanel() {
           <h1 className="font-[family-name:var(--font-display)] text-3xl font-bold">
             Executions
           </h1>
-          <p className="mt-2 text-muted">
-            Run constrained commands in an isolated sandbox for a connected repository.
+      <p className="mt-2 text-muted">
+            Run a bounded validation command in an isolated sandbox for a connected repository.
           </p>
         </div>
         <div className="flex gap-2">
@@ -218,9 +218,9 @@ export function ExecutionsPanel() {
 
       <div className="rounded-xl border border-border bg-surface/80 p-5 space-y-3">
         <h2 className="font-semibold">Recent jobs</h2>
-        {executions.isLoading ? <p className="text-muted">Loading…</p> : null}
+        {executions.isLoading ? <p className="text-muted" role="status">Loading sandbox executions…</p> : null}
         {!executions.isLoading && !(executions.data ?? []).length ? (
-          <p className="text-sm text-muted">No executions yet.</p>
+          <p className="text-sm text-muted">No executions yet. Choose a repository and a safe preset to verify its checkout.</p>
         ) : null}
         <ul className="space-y-2">
           {(executions.data ?? []).map((job) => (

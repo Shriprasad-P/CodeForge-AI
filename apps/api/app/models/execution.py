@@ -20,6 +20,7 @@ class ExecutionJobStatus(str, enum.Enum):
     failed = "failed"
     cancelled = "cancelled"
     timed_out = "timed_out"
+    repository_revoked = "repository_revoked"
 
 
 class ExecutionErrorType(str, enum.Enum):
@@ -30,6 +31,7 @@ class ExecutionErrorType(str, enum.Enum):
     cancelled = "cancelled"
     invalid_request = "invalid_request"
     internal_error = "internal_error"
+    repository_revoked = "repository_revoked"
 
 
 TERMINAL_STATUSES = frozenset(
@@ -38,6 +40,7 @@ TERMINAL_STATUSES = frozenset(
         ExecutionJobStatus.failed,
         ExecutionJobStatus.cancelled,
         ExecutionJobStatus.timed_out,
+        ExecutionJobStatus.repository_revoked,
     }
 )
 
@@ -72,6 +75,9 @@ class ExecutionJob(Base, TimestampMixin):
         ForeignKey("repository_connections.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
+    )
+    workflow_correlation_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), default=uuid4, nullable=False, index=True
     )
     status: Mapped[ExecutionJobStatus] = mapped_column(
         Enum(ExecutionJobStatus, name="execution_job_status", native_enum=False, length=32),

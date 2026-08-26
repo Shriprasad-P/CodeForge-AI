@@ -81,7 +81,7 @@ async def authenticate_user(db: AsyncSession, *, email: str, password: str) -> U
     normalized = normalize_email(email)
     user = await db.scalar(select(User).where(User.email == normalized))
     if user is None or not user.is_active or not verify_password(user.password_hash, password):
-        logger.info("user.login_failed")
+        logger.info("user.login_failed", retryable=False)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -102,7 +102,7 @@ async def create_auth_session(db: AsyncSession, user: User) -> str:
     return token
 
 
-async def get_user_for_token(db: AsyncSession, token: str | None) -> User | None:
+async def get_session_for_token(db: AsyncSession, token: str | None) -> tuple[AuthSession, User] | None:
     if not token:
         return None
     token_hash = hash_session_token(token)
@@ -118,7 +118,31 @@ async def get_user_for_token(db: AsyncSession, token: str | None) -> User | None
     now = datetime.now(UTC)
     if auth_session.revoked_at is not None or auth_session.expires_at <= now or not user.is_active:
         return None
+    return auth_session, user
+
+
+async def get_user_for_token(db: AsyncSession, token: str | None) -> User | None:
+    row = await get_session_for_token(db, token)
+    if row is None:
+        return None
+    _, user = row
     return user
+
+
+async def get_active_session_for_id(db: AsyncSession, session_id: UUID) -> AuthSession | None:
+    """Return a session only while its token, expiry, and user remain valid."""
+    result = await db.execute(
+        select(AuthSession, User)
+        .join(User, User.id == AuthSession.user_id)
+        .where(AuthSession.id == session_id)
+    )
+    row = result.first()
+    if row is None:
+        return None
+    session, user = row
+    if session.revoked_at is not None or session.expires_at <= datetime.now(UTC) or not user.is_active:
+        return None
+    return session
 
 
 async def revoke_session(db: AsyncSession, token: str | None) -> None:

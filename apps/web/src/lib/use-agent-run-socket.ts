@@ -34,6 +34,8 @@ type Options = {
 const MAX_LOG_CHARS = 120_000;
 const MAX_ACTIVITY = 200;
 const SUPPORTED_VERSION = 1;
+const MAX_RETRY_DELAY_MS = 8_000;
+const PERMANENT_CLOSE_CODES = new Set([4401, 4403, 4404, 1008]);
 
 export function useAgentRunSocket({
   runId,
@@ -73,7 +75,9 @@ export function useAgentRunSocket({
     setChangedFiles([]);
     let socket: WebSocket | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let stableTimer: ReturnType<typeof setTimeout> | null = null;
     let disposed = false;
+    let retryAttempt = 0;
 
     function appendLog(line: LiveLogLine) {
       setLogs((prev) => {
@@ -130,6 +134,11 @@ export function useAgentRunSocket({
           pushActivity(statusLabel(status), raw.timestamp);
           break;
         }
+        case "agent.run.repository_revoked":
+          setLiveStatus("repository_revoked");
+          pushActivity("Repository authorization revoked", raw.timestamp);
+          onNeedRestSyncRef.current?.();
+          break;
         case "agent.tool.started":
           pushActivity(String(data.summary || data.tool || "Tool started"), raw.timestamp);
           break;
@@ -217,7 +226,11 @@ export function useAgentRunSocket({
         if (disposed) return;
         setConnected(true);
         setReconnecting(false);
-        backoff.current = 500;
+        if (stableTimer) clearTimeout(stableTimer);
+        stableTimer = setTimeout(() => {
+          retryAttempt = 0;
+          backoff.current = 500;
+        }, 2_000);
         onNeedRestSyncRef.current?.();
       };
 
@@ -230,18 +243,33 @@ export function useAgentRunSocket({
         }
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event) => {
         setConnected(false);
         if (disposed) return;
-        setReconnecting(true);
         onNeedRestSyncRef.current?.();
-        const delay = Math.min(backoff.current, 8000);
-        backoff.current = Math.min(backoff.current * 2, 8000);
+        const code = event?.code ?? 0;
+        if (PERMANENT_CLOSE_CODES.has(code)) {
+          setReconnecting(false);
+          setWsFailed(true);
+          return;
+        }
+        if (retryAttempt >= 8) {
+          setReconnecting(false);
+          setWsFailed(true);
+          return;
+        }
+        setReconnecting(true);
+        const base = Math.min(backoff.current, MAX_RETRY_DELAY_MS);
+        // Small jitter prevents a fleet of clients from reconnecting in lockstep.
+        const jitter = base * (0.75 + Math.random() * 0.5);
+        const delay = Math.min(Math.round(jitter), MAX_RETRY_DELAY_MS);
+        retryAttempt += 1;
+        backoff.current = Math.min(backoff.current * 2, MAX_RETRY_DELAY_MS);
         timer = setTimeout(connect, delay);
       };
 
       socket.onerror = () => {
-        setWsFailed(true);
+        onNeedRestSyncRef.current?.();
       };
     }
 
@@ -250,6 +278,7 @@ export function useAgentRunSocket({
     return () => {
       disposed = true;
       if (timer) clearTimeout(timer);
+      if (stableTimer) clearTimeout(stableTimer);
       socket?.close();
     };
   }, [runId, enabled]);

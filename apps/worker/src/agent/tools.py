@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import base64
-import json
 from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import get_settings
 from sandbox_sdk.docker_provider import DockerSandboxProvider
 from src.agent.paths import PathEscapeError, safe_rel_path, workspace_path
+from src.runtime import run_blocking
 
 ALLOWED_COMMAND_PREFIXES = {
     "python",
@@ -38,13 +38,22 @@ class ToolResult:
 
 
 class AgentTools:
-    def __init__(self, provider: DockerSandboxProvider, sandbox_id: str, on_chunk=None) -> None:
+    def __init__(self, provider: DockerSandboxProvider, sandbox_id: str, on_chunk=None, cancel_event=None) -> None:
         self.provider = provider
         self.sandbox_id = sandbox_id
         self.settings = get_settings()
         self.on_chunk = on_chunk
+        self.cancel_event = cancel_event
 
-    def _exec(self, command: list[str], *, workdir: str = "/workspace", timeout: float | None = None) -> ToolResult:
+    def _exec(
+        self,
+        command: list[str],
+        *,
+        workdir: str = "/workspace",
+        timeout: float | None = None,
+        cancel_event=None,
+    ) -> ToolResult:
+        cancel_event = cancel_event if cancel_event is not None else self.cancel_event
         result = self.provider.exec(
             self.sandbox_id,
             command,
@@ -52,6 +61,7 @@ class AgentTools:
             timeout_seconds=timeout or float(self.settings.sandbox_timeout_seconds),
             max_output_bytes=self.settings.sandbox_max_output_bytes,
             on_chunk=self.on_chunk,
+            cancel_event=cancel_event,
         )
         out = result.stdout.decode("utf-8", errors="replace")
         err = result.stderr.decode("utf-8", errors="replace")
@@ -63,11 +73,17 @@ class AgentTools:
         return ToolResult(
             ok=result.exit_code == 0 and not result.timed_out,
             summary=text or f"exit {result.exit_code}",
-            data={"exit_code": result.exit_code, "timed_out": result.timed_out, "stdout": out[:limit], "stderr": err[:limit]},
+            data={
+                "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
+                "cancelled": getattr(result, "cancelled", False),
+                "stdout": out[:limit],
+                "stderr": err[:limit],
+            },
             truncated=truncated,
         )
 
-    def list_files(self, path: str = ".", max_entries: int = 200) -> ToolResult:
+    def list_files(self, path: str = ".", max_entries: int = 200, *, timeout: float | None = None, cancel_event=None) -> ToolResult:
         try:
             rel = safe_rel_path(path)
             target = workspace_path(path)
@@ -90,9 +106,9 @@ for dp, dns, fns in os.walk(root):
         break
 print(json.dumps({{"path": {rel!r}, "files": out, "truncated": len(out) >= max_entries}}))
 """
-        return self._exec(["python", "-c", py])
+        return self._exec(["python", "-c", py], timeout=timeout, cancel_event=cancel_event)
 
-    def read_file(self, path: str, start_line: int | None = None, end_line: int | None = None) -> ToolResult:
+    def read_file(self, path: str, start_line: int | None = None, end_line: int | None = None, *, timeout: float | None = None, cancel_event=None) -> ToolResult:
         try:
             target = workspace_path(path)
             safe_rel_path(path)
@@ -117,9 +133,9 @@ print(json.dumps({{"path": {rel!r}, "files": out, "truncated": len(out) >= max_e
             f"if len(data) > {max_bytes}:\n"
             "    print('... truncated')\n"
         )
-        return self._exec(["python", "-c", py])
+        return self._exec(["python", "-c", py], timeout=timeout, cancel_event=cancel_event)
 
-    def search_code(self, query: str, path: str = ".") -> ToolResult:
+    def search_code(self, query: str, path: str = ".", *, timeout: float | None = None, cancel_event=None) -> ToolResult:
         if not query or len(query) > 200:
             return ToolResult(ok=False, summary="invalid query")
         try:
@@ -130,7 +146,8 @@ print(json.dumps({{"path": {rel!r}, "files": out, "truncated": len(out) >= max_e
         # Prefer rg if present, else python fallback
         result = self._exec(
             ["rg", "-n", "--hidden", "--glob", "!.git", "-m", str(max_results), query, target],
-            timeout=30,
+            timeout=min(timeout, 30) if timeout is not None else 30,
+            cancel_event=cancel_event,
         )
         if "No such file" in result.summary or result.data and result.data.get("exit_code") == 127:
             py = f"""
@@ -150,10 +167,10 @@ for dp,dns,fns in os.walk(root):
         print(f'{{os.path.relpath(p,\"/workspace\")}}:{{i}}:{{line[:200]}}'); n+=1
         if n>={max_results}: raise SystemExit
 """
-            return self._exec(["python", "-c", py], timeout=30)
+            return self._exec(["python", "-c", py], timeout=min(timeout, 30) if timeout is not None else 30, cancel_event=cancel_event)
         return result
 
-    def write_file(self, path: str, content: str) -> ToolResult:
+    def write_file(self, path: str, content: str, *, timeout: float | None = None, cancel_event=None) -> ToolResult:
         try:
             rel = safe_rel_path(path)
             if rel == ".":
@@ -171,9 +188,9 @@ for dp,dns,fns in os.walk(root):
             f"p.write_bytes(base64.b64decode({b64!r}))\n"
             "print('wrote', p)\n"
         )
-        return self._exec(["python", "-c", py])
+        return self._exec(["python", "-c", py], timeout=timeout, cancel_event=cancel_event)
 
-    def apply_patch(self, patch: str) -> ToolResult:
+    def apply_patch(self, patch: str, *, timeout: float | None = None, cancel_event=None) -> ToolResult:
         if not patch or len(patch) > self.settings.agent_max_diff_chars:
             return ToolResult(ok=False, summary="invalid patch")
         if "/.git/" in patch or "\n.git/" in patch:
@@ -189,9 +206,16 @@ for dp,dns,fns in os.walk(root):
             "print(r.stderr)\n"
             "raise SystemExit(r.returncode)\n"
         )
-        return self._exec(["python", "-c", py])
+        return self._exec(["python", "-c", py], timeout=timeout, cancel_event=cancel_event)
 
-    def run_command(self, command: list[str], working_directory: str | None = None) -> ToolResult:
+    def run_command(
+        self,
+        command: list[str],
+        working_directory: str | None = None,
+        *,
+        timeout: float | None = None,
+        cancel_event=None,
+    ) -> ToolResult:
         if not command or not isinstance(command, list):
             return ToolResult(ok=False, summary="command must be argv list")
         if len(command) > self.settings.execution_max_command_args:
@@ -214,35 +238,61 @@ for dp,dns,fns in os.walk(root):
                 workdir = workspace_path(working_directory)
             except PathEscapeError as exc:
                 return ToolResult(ok=False, summary=str(exc))
-        return self._exec(list(command), workdir=workdir)
+        return self._exec(list(command), workdir=workdir, timeout=timeout, cancel_event=cancel_event)
 
-    def git_status(self) -> ToolResult:
-        return self._exec(["git", "status", "--short"])
+    def git_status(self, *, timeout: float | None = None, cancel_event=None) -> ToolResult:
+        return self._exec(["git", "status", "--short"], timeout=timeout, cancel_event=cancel_event)
 
-    def git_diff(self, stat: bool = False) -> ToolResult:
+    def git_diff(self, stat: bool = False, *, timeout: float | None = None, cancel_event=None) -> ToolResult:
         cmd = ["git", "diff", "--stat"] if stat else ["git", "diff"]
-        return self._exec(cmd)
+        return self._exec(cmd, timeout=timeout, cancel_event=cancel_event)
 
-    def dispatch(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+    def dispatch(self, name: str, arguments: dict[str, Any], *, timeout: float | None = None, cancel_event=None) -> ToolResult:
         try:
             if name == "list_files":
-                return self.list_files(arguments.get("path", "."), arguments.get("max_entries", 200))
+                return self.list_files(arguments.get("path", "."), arguments.get("max_entries", 200), timeout=timeout, cancel_event=cancel_event)
             if name == "read_file":
-                return self.read_file(arguments["path"], arguments.get("start_line"), arguments.get("end_line"))
+                return self.read_file(arguments["path"], arguments.get("start_line"), arguments.get("end_line"), timeout=timeout, cancel_event=cancel_event)
             if name == "search_code":
-                return self.search_code(arguments["query"], arguments.get("path", "."))
+                return self.search_code(arguments["query"], arguments.get("path", "."), timeout=timeout, cancel_event=cancel_event)
             if name == "write_file":
-                return self.write_file(arguments["path"], arguments.get("content", ""))
+                return self.write_file(arguments["path"], arguments.get("content", ""), timeout=timeout, cancel_event=cancel_event)
             if name == "apply_patch":
-                return self.apply_patch(arguments.get("patch", ""))
+                return self.apply_patch(arguments.get("patch", ""), timeout=timeout, cancel_event=cancel_event)
             if name == "run_command":
-                return self.run_command(arguments.get("command") or [], arguments.get("working_directory"))
+                return self.run_command(
+                    arguments.get("command") or [],
+                    arguments.get("working_directory"),
+                    timeout=timeout,
+                    cancel_event=cancel_event,
+                )
             if name == "git_status":
-                return self.git_status()
+                return self.git_status(timeout=timeout, cancel_event=cancel_event)
             if name == "git_diff":
-                return self.git_diff(bool(arguments.get("stat")))
+                return self.git_diff(bool(arguments.get("stat")), timeout=timeout, cancel_event=cancel_event)
             return ToolResult(ok=False, summary=f"unknown tool: {name}")
         except KeyError as exc:
             return ToolResult(ok=False, summary=f"missing argument: {exc}")
         except Exception as exc:  # noqa: BLE001
             return ToolResult(ok=False, summary=f"tool error: {exc}")
+
+    async def run_command_async(
+        self,
+        command: list[str],
+        working_directory: str | None = None,
+        *,
+        timeout: float | None = None,
+        cancel_event=None,
+    ) -> ToolResult:
+        """Run the blocking Docker SDK call off the worker event loop."""
+        return await run_blocking(
+            self.run_command,
+            command,
+            working_directory,
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
+
+    async def dispatch_async(self, name: str, arguments: dict[str, Any], *, timeout: float | None = None, cancel_event=None) -> ToolResult:
+        """Dispatch a tool without blocking the asyncio worker loop."""
+        return await run_blocking(self.dispatch, name, arguments, timeout=timeout, cancel_event=cancel_event)

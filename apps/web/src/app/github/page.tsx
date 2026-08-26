@@ -1,13 +1,14 @@
 import { Suspense } from "react";
 
 import { GitHubPanel } from "@/components/github-panel";
+import { AppShell } from "@/components/app-shell";
 
 export default function GitHubPage() {
   return (
-    <main className="mx-auto flex min-h-screen max-w-6xl px-6 py-16">
+    <AppShell>
       <Suspense fallback={<p className="text-muted">Loading GitHub integration…</p>}>
         <GitHubPanel />
       </Suspense>
-    </main>
+    </AppShell>
   );
 }

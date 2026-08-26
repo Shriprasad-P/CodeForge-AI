@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import os
-import shutil
 import tempfile
+import asyncio
+import threading
 from pathlib import Path
 
 import pytest
 
 docker = pytest.importorskip("docker")
+# ruff: noqa: E402
 
 from sandbox_sdk import SandboxSpec
 from sandbox_sdk.docker_provider import DEFAULT_SANDBOX_ENV, DockerSandboxProvider, LABEL_SANDBOX
+from src.agent.tools import AgentTools
 
 
 def _docker_available() -> bool:
@@ -118,6 +121,60 @@ def test_sandbox_timeout(provider: DockerSandboxProvider, image_ready: str) -> N
     finally:
         provider.destroy(sandbox_id)
         provider.destroy_labeled(execution_id=execution_id)
+
+
+def test_sandbox_cancellation_interrupts_command(provider: DockerSandboxProvider, image_ready: str) -> None:
+    execution_id = "test-cancellation"
+    sandbox_id = provider.create(SandboxSpec(image=image_ready, execution_id=execution_id, memory_limit="256m", pids_limit=64))
+    cancel = threading.Event()
+    timer = threading.Timer(0.4, cancel.set)
+    timer.start()
+    try:
+        result = provider.exec(
+            sandbox_id,
+            ["python", "-c", "import time; time.sleep(30)"],
+            timeout_seconds=30,
+            max_output_bytes=1024,
+            cancel_event=cancel,
+        )
+        assert result.cancelled is True
+        assert result.exit_code == 130
+        assert result.timed_out is False
+    finally:
+        timer.cancel()
+        provider.destroy(sandbox_id)
+        provider.destroy_labeled(execution_id=execution_id)
+
+
+def test_async_tools_do_not_block_other_sandbox_work(provider: DockerSandboxProvider, image_ready: str) -> None:
+    first = provider.create(SandboxSpec(image=image_ready, execution_id="test-async-a", memory_limit="256m", pids_limit=64))
+    second = provider.create(SandboxSpec(image=image_ready, execution_id="test-async-b", memory_limit="256m", pids_limit=64))
+
+    async def run() -> tuple[object, object, float]:
+        import time
+
+        start = time.monotonic()
+        a = AgentTools(provider, first)
+        b = AgentTools(provider, second)
+        long_task = asyncio.create_task(a.run_command_async(["python", "-c", "import time; time.sleep(1)"], timeout=5))
+        await asyncio.sleep(0.05)
+        short = await b.run_command_async(["python", "-c", "print('ready')"], timeout=5)
+        elapsed = time.monotonic() - start
+        long_result = await long_task
+        return long_result, short, elapsed
+
+    try:
+        long_result, short_result, elapsed = asyncio.run(run())
+        assert long_result.ok is True
+        assert short_result.ok is True
+        assert "ready" in short_result.summary
+        # The short command completed while the first command was still running.
+        assert elapsed < 0.8
+    finally:
+        provider.destroy(first)
+        provider.destroy(second)
+        provider.destroy_labeled(execution_id="test-async-a")
+        provider.destroy_labeled(execution_id="test-async-b")
 
 
 def test_fixture_checkout_and_exec(provider: DockerSandboxProvider, image_ready: str) -> None:

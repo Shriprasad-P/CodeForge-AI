@@ -10,12 +10,13 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.observability import metrics
 from app.db.redis import get_redis
 from app.models.github import (
     GitHubAccount,
@@ -23,6 +24,8 @@ from app.models.github import (
     GitHubWebhookDelivery,
     RepositoryConnection,
 )
+from app.models.agent_run import AGENT_ACTIVE, AgentRun, AgentRunErrorType, AgentRunStatus
+from app.models.execution import ACTIVE_STATUSES as EXECUTION_ACTIVE, ExecutionErrorType, ExecutionJob, ExecutionJobStatus
 from app.models.user import User
 from app.services.github_app import require_github_configured
 from app.services.github_client import GitHubAPIError, GitHubClient, raise_http_for_github
@@ -212,6 +215,7 @@ def verify_webhook_signature(body: bytes, signature_header: str | None) -> None:
     if not cfg.github_webhook_configured:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="GitHub webhooks are not configured")
     if not signature_header or not signature_header.startswith("sha256="):
+        metrics.inc("github_webhook_signature_failures_total")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing webhook signature")
     digest = hmac.new(
         cfg.github_webhook_secret.encode("utf-8"),
@@ -220,6 +224,7 @@ def verify_webhook_signature(body: bytes, signature_header: str | None) -> None:
     ).hexdigest()
     expected = f"sha256={digest}"
     if not hmac.compare_digest(expected, signature_header):
+        metrics.inc("github_webhook_signature_failures_total")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature")
 
 
@@ -351,6 +356,7 @@ async def list_accessible_repositories(
     installation = await get_owned_installation(db, user_id=user_id, installation_id=installation_id)
     gh = client or GitHubClient()
     try:
+        installation = await get_owned_installation(db, user_id=user_id, installation_id=installation_id)
         token = await gh.create_installation_token(installation.github_installation_id)
         payload = await gh.list_installation_repositories(token, page=page, per_page=per_page)
     except GitHubAPIError as exc:
@@ -387,6 +393,7 @@ async def connect_repository(
     installation = await get_owned_installation(db, user_id=user_id, installation_id=installation_id)
     gh = client or GitHubClient()
     try:
+        installation = await get_owned_installation(db, user_id=user_id, installation_id=installation_id)
         token = await gh.create_installation_token(installation.github_installation_id)
         # Confirm the repo is visible to this installation, then fetch by id.
         listing = await gh.list_installation_repositories(token, page=1, per_page=100)
@@ -465,19 +472,71 @@ async def disconnect_connection(db: AsyncSession, *, user_id: UUID, connection_i
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
     row.is_active = False
+    await _revoke_repository_workflows(db, [row.id])
     await db.flush()
 
 
 async def record_webhook_delivery(db: AsyncSession, delivery_id: str, event: str, action: str | None) -> bool:
     """Return False if delivery already processed."""
-    existing = await db.scalar(
-        select(GitHubWebhookDelivery).where(GitHubWebhookDelivery.delivery_id == delivery_id)
+    result = await db.execute(
+        pg_insert(GitHubWebhookDelivery)
+        .values(delivery_id=delivery_id, event=event, action=action)
+        .on_conflict_do_nothing(index_elements=["delivery_id"])
+        .returning(GitHubWebhookDelivery.id)
     )
-    if existing is not None:
-        return False
-    db.add(GitHubWebhookDelivery(delivery_id=delivery_id, event=event, action=action))
-    await db.flush()
-    return True
+    return result.first() is not None
+
+
+async def _revoke_repository_workflows(db: AsyncSession, connection_ids: list[UUID]) -> None:
+    """Fence every queued/in-flight workflow for revoked repositories."""
+    if not connection_ids:
+        return
+    now = datetime.now(UTC)
+    agent_states = tuple(AGENT_ACTIVE) + (
+        AgentRunStatus.awaiting_approval,
+        AgentRunStatus.publishing,
+    )
+    await db.execute(
+        update(AgentRun)
+        .where(
+            AgentRun.repository_connection_id.in_(connection_ids),
+            or_(
+                AgentRun.status.in_(agent_states),
+                and_(
+                    AgentRun.approval_status == "approved",
+                    AgentRun.publication_status.in_(
+                        ["approved", "publication_failed", "publishing"]
+                    ),
+                ),
+            ),
+        )
+        .values(
+            status=AgentRunStatus.repository_revoked,
+            cancel_requested=True,
+            error_type=AgentRunErrorType.repository_revoked,
+            error_message="Repository authorization revoked",
+            result_status="repository_revoked",
+            publication_status="revoked",
+            finished_at=now,
+            delivery_claim_token=None,
+            publication_claim_token=None,
+        )
+    )
+    await db.execute(
+        update(ExecutionJob)
+        .where(
+            ExecutionJob.repository_connection_id.in_(connection_ids),
+            ExecutionJob.status.in_(tuple(EXECUTION_ACTIVE)),
+        )
+        .values(
+            status=ExecutionJobStatus.repository_revoked,
+            cancel_requested=True,
+            error_type=ExecutionErrorType.repository_revoked,
+            error_message="Repository authorization revoked",
+            finished_at=now,
+            delivery_claim_token=None,
+        )
+    )
 
 
 async def handle_installation_webhook(db: AsyncSession, action: str, payload: dict[str, Any]) -> None:
@@ -491,8 +550,17 @@ async def handle_installation_webhook(db: AsyncSession, action: str, payload: di
 
     if action in {"deleted"}:
         if row is not None:
-            # Cascade removes connections via FK.
-            await db.delete(row)
+            # Retain the installation and connections as a revocation fence so
+            # in-flight workers cannot continue from a stale ORM snapshot.
+            row.suspended_at = datetime.now(UTC)
+            connections = list(
+                await db.scalars(
+                    select(RepositoryConnection).where(RepositoryConnection.installation_id == row.id)
+                )
+            )
+            for connection in connections:
+                connection.is_active = False
+            await _revoke_repository_workflows(db, [connection.id for connection in connections])
             await db.flush()
             logger.info("github.installation_deleted", installation_id=installation_id)
         return
@@ -500,6 +568,14 @@ async def handle_installation_webhook(db: AsyncSession, action: str, payload: di
     if action in {"suspend"}:
         if row is not None:
             row.suspended_at = datetime.now(UTC)
+            connections = list(
+                await db.scalars(
+                    select(RepositoryConnection).where(RepositoryConnection.installation_id == row.id)
+                )
+            )
+            for connection in connections:
+                connection.is_active = False
+            await _revoke_repository_workflows(db, [connection.id for connection in connections])
             await db.flush()
         return
 
@@ -540,4 +616,5 @@ async def handle_installation_repositories_webhook(db: AsyncSession, action: str
             )
             for connection in connections:
                 connection.is_active = False
+            await _revoke_repository_workflows(db, [connection.id for connection in connections])
     await db.flush()

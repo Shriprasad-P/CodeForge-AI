@@ -11,9 +11,15 @@ import structlog
 from app.core.config import settings
 
 
+def add_service(_logger: Any, _method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+    event_dict.setdefault("service", settings.app_name)
+    return event_dict
+
+
 def configure_logging() -> None:
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
+        add_service,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso"),

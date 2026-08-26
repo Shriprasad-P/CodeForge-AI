@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.deps import get_db, require_current_user
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.observability import metrics, persist_metric
 from app.models.github import GitHubAccount, GitHubInstallation, RepositoryConnection
 from app.models.user import User
 from app.schemas.github import (
@@ -326,6 +327,9 @@ async def github_webhooks(
     action = payload.get("action")
     is_new = await github_service.record_webhook_delivery(db, x_github_delivery, x_github_event, action)
     if not is_new:
+        metrics.inc("github_webhook_duplicates_total")
+        await persist_metric("github_webhook_duplicates_total")
+        logger.info("github.webhook_duplicate")
         return {"status": "duplicate"}
 
     if x_github_event == "installation":
@@ -333,6 +337,6 @@ async def github_webhooks(
     elif x_github_event == "installation_repositories":
         await github_service.handle_installation_repositories_webhook(db, str(action or ""), payload)
     else:
-        logger.info("github.webhook_ignored", event=x_github_event)
+        logger.info("github.webhook_ignored", github_event=x_github_event)
 
     return {"status": "ok"}

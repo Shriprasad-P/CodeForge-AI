@@ -11,6 +11,7 @@
   --ok: #34d399;
   --bad: #f87171;
   --warn: #fbbf24;
+  --focus: #fbbf24;
 }
 
 @theme inline {
@@ -37,6 +38,83 @@ body {
   color: var(--foreground);
   font-family: var(--font-body), ui-sans-serif, sans-serif;
   min-height: 100vh;
+}
+
+* {
+  border-color: var(--border);
+}
+
+button,
+a,
+input,
+select,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.skip-link {
+  position: absolute;
+  left: 1rem;
+  top: -3rem;
+  z-index: 50;
+  border-radius: 0.375rem;
+  background: var(--accent-soft);
+  color: var(--background);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  transition: top 120ms ease;
+}
+
+.skip-link:focus {
+  top: 1rem;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid currentColor;
+  border-radius: 9999px;
+  padding: 0.2rem 0.55rem;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 0.6875rem;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.status-pill::before {
+  width: 0.35rem;
+  height: 0.35rem;
+  border-radius: 9999px;
+  background: currentColor;
+  content: "";
+}
+
+.status-pill-ok { color: var(--ok); background: rgb(52 211 153 / 0.08); }
+.status-pill-bad { color: var(--bad); background: rgb(248 113 113 / 0.08); }
+.status-pill-warn { color: var(--warn); background: rgb(251 191 36 / 0.08); }
+.status-pill-neutral { color: var(--muted); background: rgb(139 154 171 / 0.08); }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }
 
 ::selection {

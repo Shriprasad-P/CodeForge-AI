@@ -82,7 +82,9 @@ async def test_create_list_get_execution(app_client: AsyncClient) -> None:
         )
         assert event is not None
         assert event.status == "pending"
-        assert event.payload == {"execution_id": job_id}
+        assert event.payload["execution_id"] == job_id
+        assert event.payload["workflow_correlation_id"]
+        assert event.payload["request_id"]
 
     listed = await app_client.get("/api/executions")
     assert listed.status_code == 200

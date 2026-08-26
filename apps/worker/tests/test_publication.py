@@ -20,11 +20,30 @@ from src.artifacts import PUBLICATION_ARTIFACT_VERSION, capture_publication_arti
 from src.delivery import process_outbox_event
 from app.services.outbox import PUBLICATION_REQUESTED, event_dedupe_key
 from src.publication import process_publication
+from src.publication import _git as publication_git
 
 
 def _git(path: Path, *args: str) -> str:
     result = subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True, text=True)
     return result.stdout.strip()
+
+
+def test_publication_push_token_is_not_in_git_argv_or_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "ghs_push_secret"
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["env"] = kwargs.get("env")
+        seen["askpass"] = kwargs.get("env", {}).get("GIT_ASKPASS") if kwargs.get("env") else None
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("src.publication.subprocess.run", fake_run)
+    assert publication_git(tmp_path, ["push", "origin", "branch:branch"], token=token) == ""
+    assert token not in " ".join(seen["argv"])
+    assert token not in " ".join((seen["env"] or {}).values())
+    assert seen["askpass"] is not None
+    assert not Path(str(seen["askpass"])).exists()
 
 
 @pytest.mark.asyncio
@@ -115,7 +134,7 @@ async def test_publication_commits_pushes_and_is_idempotent(tmp_path: Path, monk
             approval_artifact_version=PUBLICATION_ARTIFACT_VERSION,
             approval_base_commit_sha=base_sha,
             publication_status="approved",
-            validation={"command": None, "ok": True, "output": "No recorded validation command"},
+            validation={"command": ["python", "-c", "print(1)"], "ok": True, "output": "1", "status": "passed"},
         )
         session.add(run)
         await session.flush()
@@ -178,7 +197,7 @@ async def test_publication_commits_pushes_and_is_idempotent(tmp_path: Path, monk
             publication_artifact_version=PUBLICATION_ARTIFACT_VERSION,
             publication_change_manifest=artifact.manifest,
             publication_artifact_status="ready",
-            validation={"command": None, "ok": True},
+            validation={"command": ["python", "-c", "print(1)"], "ok": True, "status": "passed"},
             validation_artifact_hash=artifact.artifact_hash,
             base_commit_sha=base_sha,
             approval_status="approved",

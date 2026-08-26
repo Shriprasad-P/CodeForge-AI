@@ -12,11 +12,13 @@ Durable vs ephemeral:
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 from app.core.logging import get_logger
+from app.core.observability import metrics, persist_metric
 from app.db.redis import get_redis
 
 logger = get_logger(__name__)
@@ -49,6 +51,7 @@ KNOWN_EVENTS = frozenset(
         "agent.run.completed",
         "agent.run.timed_out",
         "agent.run.step_limit_reached",
+        "agent.run.repository_revoked",
         "agent.approval.required",
         "agent.approved",
         "agent.rejected",
@@ -68,6 +71,24 @@ _ws_active = 0
 _events_published = 0
 _event_publish_failures = 0
 _ws_disconnects = 0
+
+_ACQUIRE_WS_SLOT_LUA = """
+local now = tonumber(ARGV[1])
+local expires = tonumber(ARGV[2])
+local slot = ARGV[3]
+local max_user = tonumber(ARGV[4])
+local max_run = tonumber(ARGV[5])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+if redis.call('ZCARD', KEYS[1]) >= max_user or redis.call('ZCARD', KEYS[2]) >= max_run then
+  return 0
+end
+redis.call('ZADD', KEYS[1], expires, slot)
+redis.call('ZADD', KEYS[2], expires, slot)
+redis.call('EXPIRE', KEYS[1], math.ceil(expires - now))
+redis.call('EXPIRE', KEYS[2], math.ceil(expires - now))
+return 1
+"""
 
 
 def channel_for_run(run_id: UUID | str) -> str:
@@ -90,12 +111,15 @@ def metrics_snapshot() -> dict[str, int]:
 def ws_connected() -> None:
     global _ws_active
     _ws_active += 1
+    metrics.set_gauge("websocket_active_connections", _ws_active)
 
 
 def ws_disconnected() -> None:
     global _ws_active, _ws_disconnects
     _ws_active = max(0, _ws_active - 1)
     _ws_disconnects += 1
+    metrics.set_gauge("websocket_active_connections", _ws_active)
+    metrics.inc("websocket_disconnects_total")
 
 
 def build_event(
@@ -144,11 +168,25 @@ async def publish_agent_event(
         payload = build_event(event=event, run_id=run_id, sequence=sequence, data=data)
         await redis.publish(channel_for_run(run_id), serialize_event(payload))
         _events_published += 1
-        logger.info("agent.event.published", event_name=event, run_id=str(run_id), sequence=sequence)
+        metrics.inc("agent_events_published_total")
+        await persist_metric("agent_events_published_total")
+        logger.info(
+            "agent.event.published",
+            event_name=event,
+            agent_run_id=str(run_id),
+            sequence=sequence,
+        )
         return payload
     except Exception:
         _event_publish_failures += 1
-        logger.warning("agent.event.publish_failed", event_name=event, run_id=str(run_id))
+        metrics.inc("agent_event_publish_failures_total")
+        await persist_metric("agent_event_publish_failures_total")
+        logger.warning(
+            "agent.event.publish_failed",
+            event_name=event,
+            agent_run_id=str(run_id),
+            retryable=True,
+        )
         return None
 
 
@@ -183,25 +221,63 @@ def publish_agent_event_sync(
         payload = build_event(event=event, run_id=run_id, sequence=sequence, data=data)
         r.publish(channel_for_run(run_id), serialize_event(payload))
         _events_published += 1
-        logger.info("agent.event.published", event_name=event, run_id=str(run_id), sequence=sequence)
+        metrics.inc("agent_events_published_total")
+        logger.info(
+            "agent.event.published",
+            event_name=event,
+            agent_run_id=str(run_id),
+            sequence=sequence,
+        )
         return payload
     except Exception:
         _event_publish_failures += 1
-        logger.warning("agent.event.publish_failed", event_name=event, run_id=str(run_id))
+        metrics.inc("agent_event_publish_failures_total")
+        logger.warning(
+            "agent.event.publish_failed",
+            event_name=event,
+            agent_run_id=str(run_id),
+            retryable=True,
+        )
         return None
 
 
-async def acquire_ws_slot(user_id: UUID | str, run_id: UUID | str, *, max_user: int, max_run: int) -> bool:
+async def acquire_ws_slot(
+    user_id: UUID | str,
+    run_id: UUID | str,
+    *,
+    max_user: int,
+    max_run: int,
+    ttl_seconds: int = 3600,
+    slot_id: str | None = None,
+) -> bool:
     redis = get_redis()
     user_key = f"{WS_USER_PREFIX}{user_id}"
     run_key = f"{WS_RUN_PREFIX}{run_id}"
+    if slot_id is not None:
+        now = time.time()
+        expires = now + ttl_seconds
+        result = await redis.eval(
+            _ACQUIRE_WS_SLOT_LUA,
+            2,
+            user_key,
+            run_key,
+            now,
+            expires,
+            slot_id,
+            max_user,
+            max_run,
+        )
+        return bool(result)
+
+    # Compatibility path for callers that do not provide a per-socket lease.
+    # WebSocket connections always use the sorted-set path above.
     user_n = int(await redis.incr(user_key))
-    await redis.expire(user_key, 3600)
+    await redis.expire(user_key, ttl_seconds)
     if user_n > max_user:
         await redis.decr(user_key)
         return False
     run_n = int(await redis.incr(run_key))
-    await redis.expire(run_key, 3600)
+    await redis.expire(run_key, ttl_seconds)
     if run_n > max_run:
         await redis.decr(run_key)
         await redis.decr(user_key)
@@ -209,8 +285,47 @@ async def acquire_ws_slot(user_id: UUID | str, run_id: UUID | str, *, max_user: 
     return True
 
 
-async def release_ws_slot(user_id: UUID | str, run_id: UUID | str) -> None:
+async def renew_ws_slot(
+    user_id: UUID | str,
+    run_id: UUID | str,
+    *,
+    ttl_seconds: int = 3600,
+    slot_id: str | None = None,
+) -> bool:
+    """Renew both quota leases; false means a lease disappeared unexpectedly."""
     redis = get_redis()
+    user_key = f"{WS_USER_PREFIX}{user_id}"
+    run_key = f"{WS_RUN_PREFIX}{run_id}"
+    if slot_id is not None:
+        now = time.time()
+        for key in (user_key, run_key):
+            await redis.zremrangebyscore(key, 0, now)
+        user_score = await redis.zscore(user_key, slot_id)
+        run_score = await redis.zscore(run_key, slot_id)
+        if user_score is None or run_score is None:
+            return False
+        expires = now + ttl_seconds
+        await redis.zadd(user_key, {slot_id: expires})
+        await redis.zadd(run_key, {slot_id: expires})
+        await redis.expire(user_key, ttl_seconds)
+        await redis.expire(run_key, ttl_seconds)
+        return True
+    user_exists = bool(await redis.exists(user_key))
+    run_exists = bool(await redis.exists(run_key))
+    if not user_exists or not run_exists:
+        return False
+    return bool(await redis.expire(user_key, ttl_seconds)) and bool(await redis.expire(run_key, ttl_seconds))
+
+
+async def release_ws_slot(user_id: UUID | str, run_id: UUID | str, *, slot_id: str | None = None) -> None:
+    redis = get_redis()
+    if slot_id is not None:
+        try:
+            await redis.zrem(f"{WS_USER_PREFIX}{user_id}", slot_id)
+            await redis.zrem(f"{WS_RUN_PREFIX}{run_id}", slot_id)
+        except Exception:
+            pass
+        return
     for key in (f"{WS_USER_PREFIX}{user_id}", f"{WS_RUN_PREFIX}{run_id}"):
         try:
             n = int(await redis.decr(key))

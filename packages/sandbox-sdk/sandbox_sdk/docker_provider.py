@@ -186,6 +186,7 @@ class DockerSandboxProvider:
         timeout_seconds: float,
         max_output_bytes: int,
         on_chunk=None,
+        cancel_event=None,
     ) -> ExecResult:
         """Run command. Optional on_chunk(stream: 'stdout'|'stderr', text: str, truncated: bool)."""
         container = self._client.containers.get(sandbox_id)
@@ -203,6 +204,7 @@ class DockerSandboxProvider:
         stderr = bytearray()
         truncated = False
         timed_out = False
+        cancelled = False
         deadline = time.monotonic() + timeout_seconds
         pending = b""
         # Decode buffers so multi-byte UTF-8 across demux frames stays intact.
@@ -229,11 +231,14 @@ class DockerSandboxProvider:
 
         try:
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
                     break
-                ready, _, _ = select.select([raw], [], [], min(remaining, 0.5))
+                ready, _, _ = select.select([raw], [], [], min(remaining, 0.2))
                 if not ready:
                     inspect = api.exec_inspect(exec_id)
                     if not inspect.get("Running", True):
@@ -276,12 +281,21 @@ class DockerSandboxProvider:
                     _emit(stream_name, decoder, payload)
                 if truncated:
                     break
-            if timed_out:
+            if timed_out or cancelled:
                 try:
                     container.kill()
                 except Exception:
                     pass
         finally:
+            response = getattr(raw, "_response", None)
+            # Close the HTTP response before the hijacked socket.  urllib3's
+            # finalizer expects its file object to still be open while it
+            # releases the connection back to the pool.
+            try:
+                if response is not None:
+                    response.close()
+            except Exception:
+                pass
             try:
                 raw.close()
             except Exception:
@@ -290,6 +304,8 @@ class DockerSandboxProvider:
         inspect = api.exec_inspect(exec_id)
         if timed_out:
             exit_code = 124
+        elif cancelled:
+            exit_code = 130
         else:
             exit_code = int(inspect.get("ExitCode") if inspect.get("ExitCode") is not None else 1)
 
@@ -299,6 +315,7 @@ class DockerSandboxProvider:
             stderr=bytes(stderr),
             timed_out=timed_out,
             truncated=truncated,
+            cancelled=cancelled,
         )
 
     def destroy(self, sandbox_id: str) -> None:

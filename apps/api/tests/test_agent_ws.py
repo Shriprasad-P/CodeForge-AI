@@ -148,6 +148,11 @@ def test_ws_owner_connect_snapshot_and_idor(ws_api: TestClient) -> None:
         assert snap["event"] == "agent.snapshot"
         assert snap["version"] == 1
         assert snap["data"]["status"] == "queued"
+        assert "validation" in snap["data"]
+        assert "publication_artifact_hash" in snap["data"]
+        assert "approval_status" in snap["data"]
+        assert "publication_status" in snap["data"]
+        assert "approval_eligible" in snap["data"]
         assert settings.session_cookie_name not in str(snap)
 
         publish_agent_event_sync(run_id, "agent.run.started", {"status": "running"})

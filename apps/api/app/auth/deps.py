@@ -6,6 +6,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.observability import bind_observability
 from app.db.session import get_session_factory
 from app.models.user import User
 from app.services import auth as auth_service
@@ -27,7 +28,10 @@ async def get_current_user_optional(
     db: AsyncSession = Depends(get_db),
 ) -> User | None:
     token = request.cookies.get(settings.session_cookie_name)
-    return await auth_service.get_user_for_token(db, token)
+    user = await auth_service.get_user_for_token(db, token)
+    if user is not None:
+        bind_observability(user_id=str(user.id))
+    return user
 
 
 async def require_current_user(

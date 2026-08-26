@@ -13,6 +13,15 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.observability import (
+    bind_observability,
+    claim_ref,
+    classify_error,
+    clear_observability,
+    metrics,
+    persist_metric,
+    safe_error,
+)
 from app.db.session import get_session_factory
 from app.models.agent_run import AGENT_ACTIVE, AGENT_TERMINAL, AgentRun, AgentRunErrorType, AgentRunStatus
 from app.models.execution import ACTIVE_STATUSES, TERMINAL_STATUSES, ExecutionErrorType, ExecutionJob, ExecutionJobStatus
@@ -42,6 +51,12 @@ class DeliveryClaim:
     aggregate_id: UUID
     token: str
     attempt_count: int
+    workflow_correlation_id: str | None = None
+    request_id: str | None = None
+
+    @property
+    def claim_reference(self) -> str | None:
+        return claim_ref(self.token)
 
 
 def _worker_id() -> str:
@@ -57,45 +72,54 @@ def _backoff(attempt: int) -> timedelta:
 async def ensure_durable_events(db) -> None:
     """Backfill missing delivery records for pre-outbox queued workflow rows."""
     execution_rows = await db.scalars(
-        select(ExecutionJob.id).where(ExecutionJob.status.in_(tuple(ACTIVE_STATUSES)))
+        select(ExecutionJob).where(ExecutionJob.status.in_(tuple(ACTIVE_STATUSES)))
     )
-    agent_rows = await db.scalars(select(AgentRun.id).where(AgentRun.status.in_(tuple(AGENT_ACTIVE))))
+    agent_rows = await db.scalars(select(AgentRun).where(AgentRun.status.in_(tuple(AGENT_ACTIVE))))
     publication_rows = await db.scalars(
-        select(AgentRun.id).where(
+        select(AgentRun).where(
             AgentRun.approval_status == "approved",
             AgentRun.publication_status.in_(["approved", "publication_failed", "publishing"]),
             AgentRun.publication_artifact_status == "ready",
         )
     )
     values: list[dict[str, Any]] = []
-    for aggregate_id in execution_rows:
+    for job in execution_rows:
         values.append(
             {
                 "id": uuid4(),
                 "event_type": EXECUTION_REQUESTED,
-                "aggregate_id": aggregate_id,
-                "dedupe_key": f"{EXECUTION_REQUESTED}:{aggregate_id}",
-                "payload": {"execution_id": str(aggregate_id)},
+                "aggregate_id": job.id,
+                "dedupe_key": f"{EXECUTION_REQUESTED}:{job.id}",
+                "payload": {
+                    "execution_id": str(job.id),
+                    "workflow_correlation_id": str(job.workflow_correlation_id),
+                },
             }
         )
-    for aggregate_id in agent_rows:
+    for run in agent_rows:
         values.append(
             {
                 "id": uuid4(),
                 "event_type": AGENT_RUN_REQUESTED,
-                "aggregate_id": aggregate_id,
-                "dedupe_key": f"{AGENT_RUN_REQUESTED}:{aggregate_id}",
-                "payload": {"agent_run_id": str(aggregate_id)},
+                "aggregate_id": run.id,
+                "dedupe_key": f"{AGENT_RUN_REQUESTED}:{run.id}",
+                "payload": {
+                    "agent_run_id": str(run.id),
+                    "workflow_correlation_id": str(run.workflow_correlation_id),
+                },
             }
         )
-    for aggregate_id in publication_rows:
+    for run in publication_rows:
         values.append(
             {
                 "id": uuid4(),
                 "event_type": PUBLICATION_REQUESTED,
-                "aggregate_id": aggregate_id,
-                "dedupe_key": f"{PUBLICATION_REQUESTED}:{aggregate_id}",
-                "payload": {"agent_run_id": str(aggregate_id)},
+                "aggregate_id": run.id,
+                "dedupe_key": f"{PUBLICATION_REQUESTED}:{run.id}",
+                "payload": {
+                    "agent_run_id": str(run.id),
+                    "workflow_correlation_id": str(run.workflow_correlation_id),
+                },
             }
         )
     if values:
@@ -148,7 +172,8 @@ async def _mark_dead_workflow(db, event: OutboxEvent, message: str) -> None:
             update(AgentRun)
             .where(
                 AgentRun.id == event.aggregate_id,
-                AgentRun.publication_status.not_in(["published", "rejected"]),
+                AgentRun.publication_status.not_in(["published", "rejected", "revoked"]),
+                AgentRun.status.not_in(tuple(AGENT_TERMINAL)),
             )
             .values(
                 status=AgentRunStatus.failed,
@@ -166,6 +191,8 @@ async def reconcile_durable_delivery() -> None:
     now = datetime.now(timezone.utc)
     visibility_cutoff = now - timedelta(seconds=settings.outbox_dispatch_visibility_seconds)
     factory = get_session_factory()
+    recovered_count = 0
+    expired_count = 0
     async with factory() as db:
         await ensure_durable_events(db)
 
@@ -177,6 +204,7 @@ async def reconcile_durable_delivery() -> None:
             )
         )
         for event in expired_dispatches:
+            expired_count += 1
             event.dispatch_token = None
             event.dispatch_lease_expires_at = None
             if event.dispatch_attempt_count >= settings.outbox_max_attempts:
@@ -187,6 +215,8 @@ async def reconcile_durable_delivery() -> None:
                 event.status = OUTBOX_PENDING
                 event.next_attempt_at = now
                 event.last_error = "dispatcher lease expired"
+            metrics.inc("agentdock_outbox_leases_expired_total")
+            await persist_metric("agentdock_outbox_leases_expired_total")
         stale_dispatched = await db.scalars(
             select(OutboxEvent).where(
                 OutboxEvent.status == OUTBOX_DISPATCHED,
@@ -196,6 +226,7 @@ async def reconcile_durable_delivery() -> None:
             )
         )
         for event in stale_dispatched:
+            recovered_count += 1
             if event.dispatch_attempt_count >= settings.outbox_max_attempts:
                 event.status = OUTBOX_DEAD
                 event.last_error = "worker delivery visibility attempts exhausted"
@@ -205,6 +236,8 @@ async def reconcile_durable_delivery() -> None:
                 event.dispatched_at = None
                 event.next_attempt_at = now
                 event.last_error = "worker delivery visibility expired"
+            metrics.inc("agentdock_outbox_recovered_total")
+            await persist_metric("agentdock_outbox_recovered_total")
 
         expired = await db.scalars(
             select(OutboxEvent).where(
@@ -214,6 +247,7 @@ async def reconcile_durable_delivery() -> None:
             )
         )
         for event in expired:
+            expired_count += 1
             if event.attempt_count >= settings.outbox_max_attempts:
                 event.status = OUTBOX_DEAD
                 event.last_error = "worker delivery attempts exhausted"
@@ -228,7 +262,17 @@ async def reconcile_durable_delivery() -> None:
                 event.lease_expires_at = None
                 event.next_attempt_at = now
                 event.last_error = "worker lease expired"
+            metrics.inc("agentdock_outbox_leases_expired_total")
+            metrics.inc("agentdock_outbox_recovered_total")
+            await persist_metric("agentdock_outbox_leases_expired_total")
+            await persist_metric("agentdock_outbox_recovered_total")
         await db.commit()
+    if recovered_count or expired_count:
+        logger.info(
+            "outbox.reconciled",
+            recovered_jobs=recovered_count,
+            expired_leases=expired_count,
+        )
 
 
 async def dispatch_pending_outbox() -> int:
@@ -266,7 +310,7 @@ async def dispatch_pending_outbox() -> int:
         try:
             await enqueue_outbox_event(event_id)
         except Exception as exc:  # noqa: BLE001
-            message = str(exc)[:1024] or "Redis dispatch failed"
+            message = safe_error(exc, 1024) or "Redis dispatch failed"
             async with factory() as db:
                 event = await db.scalar(
                     select(OutboxEvent).where(
@@ -285,7 +329,14 @@ async def dispatch_pending_outbox() -> int:
                     if exhausted:
                         await _mark_dead_workflow(db, event, "Redis dispatch attempts exhausted")
                 await db.commit()
-            logger.warning("outbox.dispatch_failed", event_id=str(event_id), error=message)
+            logger.warning(
+                "outbox.dispatch_failed",
+                outbox_event_id=str(event_id),
+                error_class=classify_error(exc),
+                retryable=True,
+            )
+            metrics.inc("agentdock_outbox_dispatch_failures_total")
+            await persist_metric("agentdock_outbox_dispatch_failures_total")
             continue
         async with factory() as db:
             changed = await db.execute(
@@ -306,6 +357,8 @@ async def dispatch_pending_outbox() -> int:
             await db.commit()
             if changed.rowcount:
                 delivered += 1
+                metrics.inc("agentdock_outbox_dispatched_total")
+                await persist_metric("agentdock_outbox_dispatched_total")
     return delivered
 
 
@@ -332,13 +385,26 @@ async def claim_outbox_event(event_id: UUID, *, worker_id: str | None = None) ->
                 started_at=func.coalesce(OutboxEvent.started_at, now),
                 attempt_count=OutboxEvent.attempt_count + 1,
             )
-            .returning(OutboxEvent.event_type, OutboxEvent.aggregate_id, OutboxEvent.attempt_count)
+            .returning(OutboxEvent.event_type, OutboxEvent.aggregate_id, OutboxEvent.attempt_count, OutboxEvent.payload)
         )
         row = result.first()
         await db.commit()
         if row is None:
             return None
-        return DeliveryClaim(event_id, row.event_type, row.aggregate_id, token, row.attempt_count)
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        metrics.inc("agentdock_outbox_delivery_attempts_total")
+        await persist_metric("agentdock_outbox_delivery_attempts_total")
+        return DeliveryClaim(
+            event_id,
+            row.event_type,
+            row.aggregate_id,
+            token,
+            row.attempt_count,
+            workflow_correlation_id=str(payload.get("workflow_correlation_id"))
+            if payload.get("workflow_correlation_id")
+            else None,
+            request_id=str(payload.get("request_id")) if payload.get("request_id") else None,
+        )
 
 
 async def bind_workflow_claim(claim: DeliveryClaim) -> bool:
@@ -410,10 +476,20 @@ async def mark_outbox_processed(claim: DeliveryClaim) -> None:
         await db.commit()
     if changed.rowcount != 1:
         raise DeliveryClaimLost("delivery claim lost before completion")
+    metrics.inc("agentdock_outbox_processed_total")
+    await persist_metric("agentdock_outbox_processed_total")
+    logger.info(
+        "outbox.processed",
+        outbox_event_id=str(claim.event_id),
+        delivery_attempt=claim.attempt_count,
+        claim_ref=claim.claim_reference,
+        retryable=False,
+    )
 
 
 async def mark_outbox_retry(claim: DeliveryClaim, error: str, *, retryable: bool = True) -> None:
     settings = get_settings()
+    error = safe_error(error, 1024)
     factory = get_session_factory()
     async with factory() as db:
         event = await db.scalar(
@@ -436,6 +512,16 @@ async def mark_outbox_retry(claim: DeliveryClaim, error: str, *, retryable: bool
         if exhausted:
             await _mark_dead_workflow(db, event, error)
         await db.commit()
+    metrics.inc("agentdock_outbox_retries_total" if not exhausted else "agentdock_outbox_dead_total")
+    await persist_metric("agentdock_outbox_retries_total" if not exhausted else "agentdock_outbox_dead_total")
+    logger.warning(
+        "outbox.retry_scheduled" if not exhausted else "outbox.retry_exhausted",
+        outbox_event_id=str(claim.event_id),
+        delivery_attempt=claim.attempt_count,
+        error_class=classify_error(error),
+        error_message=safe_error(error),
+        retryable=retryable and not exhausted,
+    )
 
 
 async def process_outbox_event(event_id: UUID, provider, llm=None) -> None:
@@ -447,11 +533,37 @@ async def process_outbox_event(event_id: UUID, provider, llm=None) -> None:
     claim = await claim_outbox_event(event_id)
     if claim is None:
         return
+    bind_observability(
+        workflow_correlation_id=claim.workflow_correlation_id,
+        outbox_event_id=str(claim.event_id),
+        delivery_attempt=claim.attempt_count,
+        claim_ref=claim.claim_reference,
+        request_id=claim.request_id,
+        worker_id=_worker_id(),
+    )
+    logger.info(
+        "outbox.lease_acquired",
+        outbox_event_id=str(claim.event_id),
+        delivery_attempt=claim.attempt_count,
+        claim_ref=claim.claim_reference,
+        worker_id=_worker_id(),
+    )
     if claim.event_type not in SUPPORTED_EVENT_TYPES:
-        await mark_outbox_retry(claim, f"unsupported outbox event type: {claim.event_type}", retryable=False)
+        try:
+            await mark_outbox_retry(claim, f"unsupported outbox event type: {claim.event_type}", retryable=False)
+        finally:
+            clear_observability()
         return
-    if not await bind_workflow_claim(claim):
-        await mark_outbox_processed(claim)
+    try:
+        bound = await bind_workflow_claim(claim)
+    except Exception:
+        clear_observability()
+        raise
+    if not bound:
+        try:
+            await mark_outbox_processed(claim)
+        finally:
+            clear_observability()
         return
 
     stop = asyncio.Event()
@@ -488,11 +600,28 @@ async def process_outbox_event(event_id: UUID, provider, llm=None) -> None:
         else:
             await mark_outbox_processed(claim)
     except DeliveryClaimLost:
-        logger.warning("outbox.claim_lost", event_id=str(event_id), aggregate_id=str(claim.aggregate_id))
+        metrics.inc("agentdock_outbox_claim_lost_total")
+        await persist_metric("agentdock_outbox_claim_lost_total")
+        logger.warning(
+            "outbox.claim_lost",
+            outbox_event_id=str(event_id),
+            delivery_attempt=claim.attempt_count,
+            claim_ref=claim.claim_reference,
+            error_class="delivery_claim_lost",
+            retryable=True,
+        )
     except Exception as exc:  # noqa: BLE001
-        await mark_outbox_retry(claim, str(exc) or "workflow delivery failed", retryable=True)
-        logger.exception("outbox.workflow_failed", event_id=str(event_id), event_type=claim.event_type)
+        await mark_outbox_retry(claim, safe_error(exc) or "workflow delivery failed", retryable=True)
+        logger.exception(
+            "outbox.workflow_failed",
+            outbox_event_id=str(event_id),
+            delivery_attempt=claim.attempt_count,
+            claim_ref=claim.claim_reference,
+            error_class=classify_error(exc),
+            retryable=True,
+        )
     finally:
         stop.set()
         heartbeat_task.cancel()
         await asyncio.gather(heartbeat_task, return_exceptions=True)
+        clear_observability()

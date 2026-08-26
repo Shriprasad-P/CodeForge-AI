@@ -63,3 +63,28 @@
 - [x] Mocked PR creation and duplicate-delivery idempotency
 - [x] Publication event protocol and frontend approval controls
 - [ ] Live GitHub App installation and PR creation (requires repository credentials)
+
+## Stage 6 — Observability and full-system reliability
+
+- [x] Request/workflow correlation and canonical structured-field tests
+- [x] Health/readiness, migration compatibility, and worker-heartbeat tests
+- [x] Deterministic golden path with real PostgreSQL, Redis, Docker, local Git,
+  fake LLM, and GitHub stub
+- [x] Deterministic Redis, lease, validation, cancellation, revocation,
+  tamper, stale-base, duplicate, WebSocket, GitHub, and sandbox fault tests
+- [x] Synthetic-secret scan and baseline timing report (baseline only; no
+  timing threshold is enforced)
+- [x] Dependency advisory and migration-drift assessment (`docs/dependency-audit.md`)
+- [x] Operations checklist: `docs/operations.md`
+
+The Docker fixture checkout test resolves the repository root instead of relying
+on the current working directory, so it is valid from both the worker directory
+and the repository root.
+
+## Stage 7 — Product UX and demo readiness
+
+- [x] Product-first landing page with workflow and trust-boundary explanation
+- [x] Shared responsive navigation and accessible focus/reduced-motion defaults
+- [x] Data-backed dashboard summary and contextual empty/loading states
+- [x] Agent timeline, activity/output separation, bounded diff navigation, and approval context
+- [x] Product-first README, architecture diagram, demo scenario, and screenshot plan

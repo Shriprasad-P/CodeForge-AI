@@ -225,6 +225,17 @@ describe("AgentPanel live streaming", () => {
     });
   });
 
+  it("does not reconnect forever after a permanent authorization close", async () => {
+    stubAuthAndRun();
+    renderWithQuery(<AgentPanel />);
+    await waitFor(() => expect(sockets.length).toBeGreaterThan(0));
+    sockets[0].onclose?.({ code: 4401 });
+    await waitFor(() => {
+      expect(screen.queryByText(/reconnecting/i)).toBeNull();
+      expect(sockets).toHaveLength(1);
+    });
+  });
+
   it("cancels via REST", async () => {
     const user = await import("@testing-library/user-event").then((m) => m.default.setup());
     let cancelled = false;

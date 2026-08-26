@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import httpx
@@ -7,6 +8,7 @@ from fastapi import HTTPException, status
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.observability import classify_error, metrics, persist_metric
 from app.services.github_app import create_app_jwt, require_github_configured
 
 logger = get_logger(__name__)
@@ -62,10 +64,13 @@ class GitHubClient:
         settings = get_settings()
         owns = self._client is None
         client = self._client or httpx.AsyncClient(timeout=settings.github_http_timeout_seconds)
+        started = time.perf_counter()
         try:
             response = await client.request(method, url, headers=headers, params=params, json=json)
         except httpx.HTTPError as exc:
-            logger.warning("github.http_error")
+            metrics.inc("github_request_failures_total")
+            await persist_metric("github_request_failures_total")
+            logger.warning("github.http_error", error_class=classify_error(exc), retryable=True)
             raise GitHubAPIError("GitHub unreachable") from exc
         finally:
             if owns:
@@ -78,8 +83,11 @@ class GitHubClient:
                 retry_after=response.headers.get("retry-after") or response.headers.get("x-ratelimit-reset"),
             )
         if response.status_code >= 400:
-            logger.info("github.api_error", status=response.status_code)
+            metrics.inc("github_request_failures_total")
+            await persist_metric("github_request_failures_total")
+            logger.info("github.api_error", status=response.status_code, retryable=response.status_code >= 500)
             raise GitHubAPIError("GitHub API error", status_code=response.status_code)
+        metrics.observe_duration("github_request_duration_ms", (time.perf_counter() - started) * 1000)
         if response.status_code == 204 or not expect_json:
             return None
         return response.json()

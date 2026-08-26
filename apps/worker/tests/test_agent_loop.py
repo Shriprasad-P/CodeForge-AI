@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import select
 
 docker = pytest.importorskip("docker")
+# ruff: noqa: E402
 
 from app.auth.security import hash_password
 from app.core.config import get_settings
@@ -221,8 +222,17 @@ async def test_agent_publishes_lifecycle_events(image_ready: str, monkeypatch: p
             max_steps=20,
         )
         session.add(run)
+        await session.flush()
+        event = OutboxEvent(
+            event_type=AGENT_RUN_REQUESTED,
+            aggregate_id=run.id,
+            dedupe_key=event_dedupe_key(AGENT_RUN_REQUESTED, run.id),
+            payload={"agent_run_id": str(run.id)},
+        )
+        session.add(event)
         await session.commit()
         run_id = run.id
+        event_id = event.id
 
     settings = get_settings()
     sub = redis_async.from_url(settings.redis_url, decode_responses=True)
@@ -243,7 +253,7 @@ async def test_agent_publishes_lifecycle_events(image_ready: str, monkeypatch: p
             await asyncio.sleep(0.05)
 
     collector = asyncio.create_task(collect())
-    await process_agent_run(run_id, DockerSandboxProvider(), llm=FakeLLMProvider())
+    await process_outbox_event(event_id, DockerSandboxProvider(), llm=FakeLLMProvider())
     try:
         await asyncio.wait_for(collector, timeout=30)
     except asyncio.TimeoutError:

@@ -1,9 +1,8 @@
 import { AgentPanel } from "@/components/agent-panel";
+import { AppShell } from "@/components/app-shell";
 
 export default function AgentPage() {
   return (
-    <main className="mx-auto flex min-h-screen max-w-6xl px-6 py-16">
-      <AgentPanel />
-    </main>
+    <AppShell><AgentPanel /></AppShell>
   );
 }

@@ -24,6 +24,7 @@ class AgentRunStatus(str, enum.Enum):
     cancelled = "cancelled"
     timed_out = "timed_out"
     step_limit_reached = "step_limit_reached"
+    repository_revoked = "repository_revoked"
 
 
 class AgentRunErrorType(str, enum.Enum):
@@ -43,6 +44,7 @@ class AgentRunErrorType(str, enum.Enum):
     approval_invalidated = "approval_invalidated"
     artifact_too_large = "artifact_too_large"
     unsupported_artifact = "unsupported_artifact"
+    repository_revoked = "repository_revoked"
 
 
 AGENT_TERMINAL = frozenset(
@@ -53,6 +55,7 @@ AGENT_TERMINAL = frozenset(
         AgentRunStatus.timed_out,
         AgentRunStatus.step_limit_reached,
         AgentRunStatus.rejected,
+        AgentRunStatus.repository_revoked,
     }
 )
 
@@ -81,6 +84,9 @@ class AgentRun(Base, TimestampMixin):
         ForeignKey("repository_connections.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
+    )
+    workflow_correlation_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), default=uuid4, nullable=False, index=True
     )
     status: Mapped[AgentRunStatus] = mapped_column(
         Enum(AgentRunStatus, name="agent_run_status", native_enum=False, length=32),

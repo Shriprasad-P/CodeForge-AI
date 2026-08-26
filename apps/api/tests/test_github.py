@@ -18,6 +18,8 @@ from sqlalchemy import select
 from app.core.config import get_settings
 from app.db.session import get_session_factory
 from app.models.github import GitHubInstallation, RepositoryConnection
+from app.models.agent_run import AgentRun, AgentRunErrorType, AgentRunStatus
+from app.models.execution import ExecutionErrorType, ExecutionJob, ExecutionJobStatus
 from app.services import github as github_service
 from app.services.github_app import create_app_jwt, decode_app_jwt_unsafe_for_tests
 
@@ -596,6 +598,71 @@ async def test_connection_idor(app_client: AsyncClient, github_settings: str) ->
 
 
 @pytest.mark.asyncio
+async def test_disconnect_fences_queued_workflows(app_client: AsyncClient) -> None:
+    await _register(app_client, "revoke@example.com")
+    factory = get_session_factory()
+    async with factory() as session:
+        from app.models.user import User
+
+        user = await session.scalar(select(User).where(User.email == "revoke@example.com"))
+        assert user is not None
+        installation = GitHubInstallation(
+            user_id=user.id,
+            github_installation_id=8801,
+            account_login="revoke",
+            account_type="User",
+            account_id=8801,
+            repository_selection="selected",
+        )
+        session.add(installation)
+        await session.flush()
+        connection = RepositoryConnection(
+            user_id=user.id,
+            installation_id=installation.id,
+            github_repository_id=8801,
+            owner="revoke",
+            name="repo",
+            full_name="revoke/repo",
+            default_branch="main",
+            private=True,
+            html_url="https://github.com/revoke/repo",
+            is_active=True,
+        )
+        session.add(connection)
+        await session.flush()
+        run = AgentRun(
+            user_id=user.id,
+            repository_connection_id=connection.id,
+            status=AgentRunStatus.running,
+            task="queued work",
+            model_provider="fake",
+            model_name="fake",
+            max_steps=20,
+        )
+        job = ExecutionJob(
+            user_id=user.id,
+            repository_connection_id=connection.id,
+            status=ExecutionJobStatus.queued,
+            command=["python", "-c", "print(1)"],
+        )
+        session.add_all([run, job])
+        await session.commit()
+        connection_id = connection.id
+        run_id = run.id
+        job_id = job.id
+
+    response = await app_client.delete(f"/api/github/connections/{connection_id}")
+    assert response.status_code == 204
+    async with factory() as session:
+        revoked_run = await session.get(AgentRun, run_id)
+        revoked_job = await session.get(ExecutionJob, job_id)
+        assert revoked_run is not None and revoked_run.status == AgentRunStatus.repository_revoked
+        assert revoked_run.error_type == AgentRunErrorType.repository_revoked
+        assert revoked_job is not None and revoked_job.status == ExecutionJobStatus.repository_revoked
+        assert revoked_job.error_type == ExecutionErrorType.repository_revoked
+
+
+@pytest.mark.asyncio
 async def test_webhook_signature_and_idempotency(app_client: AsyncClient, github_settings: str) -> None:
     body = b'{"action":"deleted","installation":{"id":321,"account":{"login":"x","id":1,"type":"User"}}}'
     secret = b"whsec-test"
@@ -619,6 +686,32 @@ async def test_webhook_signature_and_idempotency(app_client: AsyncClient, github
     assert ok.json()["status"] == "ok"
     dup = await app_client.post("/api/github/webhooks", content=body, headers=headers)
     assert dup.json()["status"] == "duplicate"
+
+
+@pytest.mark.asyncio
+async def test_webhook_idempotency_is_atomic_under_concurrency(app_client: AsyncClient) -> None:
+    factory = get_session_factory()
+
+    async def record() -> bool:
+        async with factory() as session:
+            accepted = await github_service.record_webhook_delivery(
+                session,
+                "concurrent-delivery",
+                "installation",
+                "suspend",
+            )
+            await session.commit()
+            return accepted
+
+    first, second = await gather(record(), record())
+    assert sorted((first, second)) == [False, True]
+    async with factory() as session:
+        rows = await session.scalars(
+            select(github_service.GitHubWebhookDelivery).where(
+                github_service.GitHubWebhookDelivery.delivery_id == "concurrent-delivery"
+            )
+        )
+        assert len(list(rows)) == 1
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.observability import current_request_id, new_workflow_correlation_id
+from app.core.observability import metrics, persist_metric
 from app.models.agent_run import (
     AGENT_ACTIVE,
     AGENT_TERMINAL,
@@ -83,6 +85,8 @@ async def create_agent_run(
     installation = await db.get(GitHubInstallation, connection.installation_id)
     if installation is None or installation.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repository connection not found")
+    if installation.suspended_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="GitHub installation is suspended")
 
     if agent_session_id is not None:
         session = await db.scalar(
@@ -111,6 +115,7 @@ async def create_agent_run(
         model_provider=settings.llm_provider,
         model_name=settings.llm_model,
         max_steps=settings.agent_max_steps,
+        workflow_correlation_id=new_workflow_correlation_id(),
     )
     db.add(run)
     await db.flush()
@@ -119,10 +124,18 @@ async def create_agent_run(
         event_type=AGENT_RUN_REQUESTED,
         aggregate_id=run.id,
         payload={"agent_run_id": str(run.id)},
+        workflow_correlation_id=run.workflow_correlation_id,
+        request_id=current_request_id(),
     )
     await db.commit()
     await db.refresh(run)
-    logger.info("agent.run.queued", agent_run_id=str(run.id), user_id=str(user.id))
+    logger.info(
+        "agent.run.queued",
+        agent_run_id=str(run.id),
+        repository_connection_id=str(run.repository_connection_id),
+        workflow_correlation_id=str(run.workflow_correlation_id),
+        user_id=str(user.id),
+    )
     try:
         from app.services.agent_events import publish_agent_event
 
@@ -164,7 +177,9 @@ async def request_cancel(db: AsyncSession, *, user_id: UUID, run_id: UUID) -> Ag
         run.finished_at = datetime.now(timezone.utc)
         await db.commit()
         await db.refresh(run)
-        logger.info("agent.run.cancelled", agent_run_id=str(run.id), phase="queued")
+        logger.info("agent.run.cancelled", agent_run_id=str(run.id), phase="queued", state_to="cancelled")
+        metrics.inc("agentdock_agent_runs_cancelled_total")
+        await persist_metric("agentdock_agent_runs_cancelled_total")
         try:
             from app.services.agent_events import publish_agent_event
 
@@ -203,6 +218,8 @@ async def approve_agent_run(
     run = await get_user_run(db, user_id=user_id, run_id=run_id)
     if run.status != AgentRunStatus.awaiting_approval:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run is not awaiting approval")
+    if run.cancel_requested:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run cancellation is in progress")
     if run.approval_status != "pending" or run.publication_status != "pending":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Run approval is no longer available")
     artifact = bytes(run.publication_artifact) if run.publication_artifact is not None else None
@@ -255,6 +272,7 @@ async def approve_agent_run(
             AgentRun.publication_artifact_version == artifact_version,
             AgentRun.base_commit_sha == base_commit_sha,
             AgentRun.validation_artifact_hash == persisted_hash,
+            AgentRun.cancel_requested.is_(False),
         )
         .values(
             approval_status="approved",
@@ -274,11 +292,24 @@ async def approve_agent_run(
         event_type=PUBLICATION_REQUESTED,
         aggregate_id=run_id,
         payload={"agent_run_id": str(run_id), "artifact_hash": persisted_hash},
+        workflow_correlation_id=run.workflow_correlation_id,
+        request_id=current_request_id(),
     )
     await db.commit()
     from app.services.agent_events import publish_agent_event
 
     await publish_agent_event(run_id, "agent.approved", {"publication_status": "approved"})
+    metrics.inc("agentdock_approvals_total")
+    await persist_metric("agentdock_approvals_total")
+    logger.info(
+        "agent.approval.accepted",
+        agent_run_id=str(run_id),
+        repository_connection_id=str(run.repository_connection_id),
+        workflow_correlation_id=str(run.workflow_correlation_id),
+        state_from="awaiting_approval",
+        state_to="awaiting_approval",
+        retryable=False,
+    )
     return await get_user_run(db, user_id=user_id, run_id=run_id)
 
 
@@ -295,4 +326,13 @@ async def reject_agent_run(db: AsyncSession, *, user_id: UUID, run_id: UUID) -> 
     from app.services.agent_events import publish_agent_event
 
     await publish_agent_event(run_id, "agent.rejected", {"publication_status": "rejected"})
+    logger.info(
+        "agent.approval.rejected",
+        agent_run_id=str(run_id),
+        repository_connection_id=str(run.repository_connection_id),
+        workflow_correlation_id=str(run.workflow_correlation_id),
+        state_from="awaiting_approval",
+        state_to="rejected",
+        retryable=False,
+    )
     return run
