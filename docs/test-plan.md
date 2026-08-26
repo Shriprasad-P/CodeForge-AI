@@ -5,7 +5,7 @@
 - [x] API unit/integration: `/api/health`, `/api/ready`, `/api/metrics`
 - [x] DB/Redis check helpers
 - [x] Frontend: SystemStatus happy path + API down + dependency unhealthy
-- [x] Compose smoke: `docker compose up --build` then curl health/ready
+- [x] Compose smoke (development): `docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build` then curl health/ready
 
 ## Phase 2
 

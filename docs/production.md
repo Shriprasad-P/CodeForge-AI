@@ -1,8 +1,24 @@
 # Production deployment notes
 
-## Current (Phase 1)
+## Compose environments
 
-Compose is for local development. Do not run the default Compose stack as production.
+The base `docker-compose.yml` keeps PostgreSQL and Redis on the private
+Compose network and requires credentials to be supplied by the environment.
+For local development, copy `.env.example` to `.env` and explicitly add the
+development-only host-port override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+Do not run the development override as production. Production startup also
+fails closed when `APP_ENV=production` uses the known database password,
+the default session secret, missing database credentials, or an insecure
+cookie setting.
+
+Stage 1 keeps the existing shared PostgreSQL connection configuration for the
+API and worker; separate least-privilege database roles are intentionally
+deferred with the broader database architecture work.
 
 ## Target production shape
 

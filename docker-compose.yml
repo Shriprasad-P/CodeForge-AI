@@ -3,15 +3,13 @@ services:
     image: postgres:16-alpine
     container_name: agentdock-postgres
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-agentdock}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentdock_dev_password}
-      POSTGRES_DB: ${POSTGRES_DB:-agentdock}
-    ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agentdock} -d ${POSTGRES_DB:-agentdock}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?POSTGRES_USER must be set} -d ${POSTGRES_DB:?POSTGRES_DB must be set}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -19,8 +17,6 @@ services:
   redis:
     image: redis:7-alpine
     container_name: agentdock-redis
-    ports:
-      - "${REDIS_PORT:-6380}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -37,11 +33,11 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-agentdock}:${POSTGRES_PASSWORD:-agentdock_dev_password}@postgres:5432/${POSTGRES_DB:-agentdock}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}
       REDIS_URL: redis://redis:6379/0
       CORS_ORIGINS: http://localhost:3000
-      APP_ENV: ${APP_ENV:-development}
-      SESSION_SECRET: ${SESSION_SECRET:-dev-only-change-me-agentdock-session-secret}
+      APP_ENV: ${APP_ENV:?APP_ENV must be set}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set}
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-604800}
       SANDBOX_CHECKOUT_MODE: ${SANDBOX_CHECKOUT_MODE:-fixture}
       LLM_PROVIDER: ${LLM_PROVIDER:-fake}
@@ -64,9 +60,10 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-agentdock}:${POSTGRES_PASSWORD:-agentdock_dev_password}@postgres:5432/${POSTGRES_DB:-agentdock}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}
       REDIS_URL: redis://redis:6379/0
-      APP_ENV: ${APP_ENV:-development}
+      APP_ENV: ${APP_ENV:?APP_ENV must be set}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set}
       SANDBOX_PROVIDER: docker
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-agentdock-sandbox:local}
       SANDBOX_CPU_LIMIT: ${SANDBOX_CPU_LIMIT:-1.0}

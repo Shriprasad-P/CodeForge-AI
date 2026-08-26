@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from datetime import UTC, datetime, timedelta
+from asyncio import gather
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import HTTPException
 from httpx import AsyncClient
 from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.db.session import get_session_factory
 from app.models.github import GitHubInstallation, RepositoryConnection
+from app.services import github as github_service
 from app.services.github_app import create_app_jwt, decode_app_jwt_unsafe_for_tests
 
 
@@ -119,6 +123,309 @@ async def test_oauth_state_and_callback(app_client: AsyncClient, github_settings
     status = await app_client.get("/api/github/status")
     assert status.json()["linked"] is True
     assert status.json()["github_login"] == "octocat"
+
+
+async def _linked_installation_state(
+    client: AsyncClient,
+    email: str,
+    github_user_id: int = 42,
+    github_login: str = "octocat",
+) -> str:
+    await _register(client, email)
+    connect = await client.get("/api/github/connect")
+    link_state = parse_qs(urlparse(connect.json()["authorize_url"]).query)["state"][0]
+    with patch("app.api.github.GitHubClient") as client_cls:
+        instance = client_cls.return_value
+        instance.exchange_oauth_code = AsyncMock(return_value="oauth-token")
+        instance.get_authenticated_user = AsyncMock(
+            return_value={"id": github_user_id, "login": github_login, "type": "User"}
+        )
+        callback = await client.get(
+            "/api/github/callback",
+            params={"code": "code", "state": link_state},
+            follow_redirects=False,
+        )
+    assert callback.status_code == 302
+    return parse_qs(urlparse(callback.headers["location"]).query)["state"][0]
+
+
+def _personal_installation_payload(installation_id: int = 7001, account_id: int = 42) -> dict[str, object]:
+    return {
+        "id": installation_id,
+        "account": {"id": account_id, "login": "octocat", "type": "User"},
+        "repository_selection": "selected",
+    }
+
+
+def _organization_installation_payload(installation_id: int = 7002) -> dict[str, object]:
+    return {
+        "id": installation_id,
+        "account": {"id": 9001, "login": "acme", "type": "Organization"},
+        "repository_selection": "selected",
+    }
+
+
+def _configure_setup_client(client_cls: object, payload: dict[str, object], user_id: int = 42) -> AsyncMock:
+    instance = client_cls.return_value
+    instance.get_authenticated_user = AsyncMock(return_value={"id": user_id, "login": "octocat", "type": "User"})
+    instance.get_installation = AsyncMock(return_value=payload)
+    instance.get_user_installation = AsyncMock(return_value=payload)
+    instance.get_organization_membership = AsyncMock(return_value={"state": "active", "role": "admin"})
+    return instance
+
+
+@pytest.mark.asyncio
+async def test_generic_link_state_cannot_be_used_for_installation_setup(
+    app_client: AsyncClient, github_settings: str
+) -> None:
+    await _register(app_client, "generic-state@example.com")
+    connect = await app_client.get("/api/github/connect")
+    link_state = parse_qs(urlparse(connect.json()["authorize_url"]).query)["state"][0]
+    response = await app_client.get(
+        "/api/github/setup",
+        params={"installation_id": 7001, "state": link_state},
+        follow_redirects=False,
+    )
+    assert "invalid_state" in response.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_expired_installation_state_fails(app_client: AsyncClient, github_settings: str) -> None:
+    state = await _linked_installation_state(app_client, "expired-state@example.com")
+    from app.db.redis import get_redis
+
+    await get_redis().expire(f"{github_service.INSTALLATION_STATE_PREFIX}{state}", 0)
+    response = await app_client.get(
+        "/api/github/setup",
+        params={"installation_id": 7001, "state": state},
+        follow_redirects=False,
+    )
+    assert "invalid_state" in response.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_installation_state_consumption_is_single_use(
+    app_client: AsyncClient, github_settings: str
+) -> None:
+    state = await _linked_installation_state(app_client, "concurrent-state@example.com")
+
+    async def consume():
+        try:
+            return await github_service.consume_installation_setup_state(state)
+        except HTTPException as exc:
+            return exc
+
+    results = await gather(consume(), consume())
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(isinstance(result, HTTPException) for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_consumed_installation_state_cannot_be_replayed(
+    app_client: AsyncClient, github_settings: str
+) -> None:
+    state = await _linked_installation_state(app_client, "replay-state@example.com")
+    payload = _personal_installation_payload()
+    with patch("app.api.github.GitHubClient") as client_cls:
+        _configure_setup_client(client_cls, payload)
+        first = await app_client.get(
+            "/api/github/setup",
+            params={"installation_id": 7001, "state": state},
+            follow_redirects=False,
+        )
+    assert "installed=1" in first.headers["location"]
+    second = await app_client.get(
+        "/api/github/setup",
+        params={"installation_id": 7001, "state": state},
+        follow_redirects=False,
+    )
+    assert "invalid_state" in second.headers["location"]
+
+    factory = get_session_factory()
+    async with factory() as session:
+        assert await session.scalar(
+            select(GitHubInstallation).where(GitHubInstallation.github_installation_id == 7001)
+        ) is not None
+
+
+@pytest.mark.asyncio
+async def test_foreign_personal_installation_cannot_be_claimed(
+    app_client: AsyncClient, github_settings: str
+) -> None:
+    state = await _linked_installation_state(app_client, "foreign-installation@example.com")
+    payload = _personal_installation_payload(account_id=99)
+    with patch("app.api.github.GitHubClient") as client_cls:
+        _configure_setup_client(client_cls, payload)
+        response = await app_client.get(
+            "/api/github/setup",
+            params={"installation_id": 7001, "state": state},
+            follow_redirects=False,
+        )
+    assert "setup_failed" in response.headers["location"]
+
+    factory = get_session_factory()
+    async with factory() as session:
+        assert await session.scalar(
+            select(GitHubInstallation).where(GitHubInstallation.github_installation_id == 7001)
+        ) is None
+
+
+@pytest.mark.asyncio
+async def test_linked_github_identity_mismatch_fails(app_client: AsyncClient, github_settings: str) -> None:
+    state = await _linked_installation_state(app_client, "identity-mismatch@example.com")
+    factory = get_session_factory()
+    async with factory() as session:
+        from app.models.github import GitHubAccount
+        from app.models.user import User
+
+        user = await session.scalar(select(User).where(User.email == "identity-mismatch@example.com"))
+        account = await session.scalar(select(GitHubAccount).where(GitHubAccount.user_id == user.id))
+        account.github_user_id = 99
+        await session.commit()
+
+    response = await app_client.get(
+        "/api/github/setup",
+        params={"installation_id": 7001, "state": state},
+        follow_redirects=False,
+    )
+    assert "identity_mismatch" in response.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_authorized_personal_installation_succeeds(app_client: AsyncClient, github_settings: str) -> None:
+    state = await _linked_installation_state(app_client, "personal-installation@example.com")
+    payload = _personal_installation_payload()
+    with patch("app.api.github.GitHubClient") as client_cls:
+        instance = _configure_setup_client(client_cls, payload)
+        response = await app_client.get(
+            "/api/github/setup",
+            params={"installation_id": 7001, "state": state},
+            follow_redirects=False,
+        )
+    assert "installed=1" in response.headers["location"]
+    instance.get_user_installation.assert_awaited_once_with(7001, "oauth-token")
+
+
+@pytest.mark.asyncio
+async def test_github_api_failure_preserves_setup_state_for_retry(
+    app_client: AsyncClient, github_settings: str
+) -> None:
+    state = await _linked_installation_state(app_client, "retry-installation@example.com")
+    payload = _personal_installation_payload(7006)
+    with patch("app.api.github.GitHubClient") as client_cls:
+        instance = client_cls.return_value
+        instance.get_authenticated_user = AsyncMock(
+            side_effect=[github_service.GitHubAPIError("temporary", status_code=503), {"id": 42}]
+        )
+        instance.get_installation = AsyncMock(return_value=payload)
+        instance.get_user_installation = AsyncMock(return_value=payload)
+        first = await app_client.get(
+            "/api/github/setup",
+            params={"installation_id": 7006, "state": state},
+            follow_redirects=False,
+        )
+        assert "setup_failed" in first.headers["location"]
+        factory = get_session_factory()
+        async with factory() as session:
+            assert await session.scalar(
+                select(GitHubInstallation).where(GitHubInstallation.github_installation_id == 7006)
+            ) is None
+        second = await app_client.get(
+            "/api/github/setup",
+            params={"installation_id": 7006, "state": state},
+            follow_redirects=False,
+        )
+    assert "installed=1" in second.headers["location"]
+    async with factory() as session:
+        assert await session.scalar(
+            select(GitHubInstallation).where(GitHubInstallation.github_installation_id == 7006)
+        ) is not None
+
+
+@pytest.mark.asyncio
+async def test_authorized_organization_installation_succeeds(
+    app_client: AsyncClient, github_settings: str
+) -> None:
+    state = await _linked_installation_state(app_client, "organization-installation@example.com")
+    payload = _organization_installation_payload()
+    with patch("app.api.github.GitHubClient") as client_cls:
+        _configure_setup_client(client_cls, payload)
+        response = await app_client.get(
+            "/api/github/setup",
+            params={"installation_id": 7002, "state": state},
+            follow_redirects=False,
+        )
+    assert "installed=1" in response.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_claim_organization_installation(
+    app_client: AsyncClient, github_settings: str
+) -> None:
+    state = await _linked_installation_state(app_client, "organization-member@example.com")
+    payload = _organization_installation_payload(7005)
+    with patch("app.api.github.GitHubClient") as client_cls:
+        instance = _configure_setup_client(client_cls, payload)
+        instance.get_organization_membership = AsyncMock(return_value={"state": "active", "role": "member"})
+        response = await app_client.get(
+            "/api/github/setup",
+            params={"installation_id": 7005, "state": state},
+            follow_redirects=False,
+        )
+    assert "setup_failed" in response.headers["location"]
+
+    factory = get_session_factory()
+    async with factory() as session:
+        assert await session.scalar(
+            select(GitHubInstallation).where(GitHubInstallation.github_installation_id == 7005)
+        ) is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_installation_claims_have_one_owner(
+    app_client: AsyncClient, github_settings: str
+) -> None:
+    await _register(app_client, "race-a@example.com")
+    await _register(app_client, "race-b@example.com")
+    factory = get_session_factory()
+    async with factory() as session:
+        from app.models.user import User
+
+        users = list((await session.scalars(select(User).order_by(User.email))).all())
+    payload = _organization_installation_payload(7003)
+
+    async def claim(user_id):
+        async with factory() as session:
+            try:
+                await github_service.upsert_installation(
+                    session,
+                    user_id=user_id,
+                    installation_payload=payload,
+                )
+                await session.commit()
+                return "ok"
+            except Exception as exc:  # HTTPException is the expected loser path.
+                await session.rollback()
+                return exc
+
+    results = await gather(*(claim(user.id) for user in users))
+    assert sum(result == "ok" for result in results) == 1
+    assert sum(isinstance(result, HTTPException) and result.status_code == 409 for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_setup_redirect_never_exposes_tokens(app_client: AsyncClient, github_settings: str) -> None:
+    state = await _linked_installation_state(app_client, "setup-secrets@example.com")
+    payload = _personal_installation_payload(7004)
+    with patch("app.api.github.GitHubClient") as client_cls:
+        _configure_setup_client(client_cls, payload)
+        response = await app_client.get(
+            "/api/github/setup",
+            params={"installation_id": 7004, "state": state},
+            follow_redirects=False,
+        )
+    assert "oauth-token" not in response.headers["location"]
+    assert "private_key" not in response.text
 
 
 @pytest.mark.asyncio
@@ -304,8 +611,6 @@ async def test_webhook_signature_and_idempotency(app_client: AsyncClient, github
 
     factory = get_session_factory()
     async with factory() as session:
-        from app.models.user import User
-
         # Need a user row for FK if we insert installation; for deleted with no row, ok.
         await session.commit()
 

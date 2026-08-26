@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 from functools import cached_property, lru_cache
 from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _HERE = Path(__file__).resolve()
+DEFAULT_DATABASE_PASSWORD = "agentdock_dev_password"
+DEFAULT_SESSION_SECRET = "dev-only-change-me-agentdock-session-secret"
 
 
 def _env_files() -> tuple[str, ...]:
@@ -39,15 +43,13 @@ class Settings(BaseSettings):
     # Comma-separated or JSON array string (avoid list[] so dotenv does not JSON-decode first)
     cors_origins: str = "http://localhost:3000"
 
-    database_url: str = (
-        "postgresql+asyncpg://agentdock:agentdock_dev_password@localhost:5433/agentdock"
-    )
+    database_url: str = f"postgresql+asyncpg://agentdock:{DEFAULT_DATABASE_PASSWORD}@localhost:5433/agentdock"
     redis_url: str = "redis://localhost:6380/0"
 
     ready_timeout_seconds: float = 2.0
 
     # Auth (Phase 2) — SESSION_SECRET is only for future signed payloads; sessions use hashed tokens.
-    session_secret: str = "dev-only-change-me-agentdock-session-secret"
+    session_secret: str = DEFAULT_SESSION_SECRET
     session_ttl_seconds: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "agentdock_session"
     cookie_secure: bool | None = None  # None → Secure when app_env != development
@@ -123,6 +125,49 @@ class Settings(BaseSettings):
     git_author_email: str = "agentdock@users.noreply.github.com"
     publication_test_remote_url: str = ""
     publication_mock_prs: bool = False
+
+    def __init__(self, **values: Any) -> None:
+        super().__init__(**values)
+        self.validate_production_security()
+
+    def validate_production_security(self) -> None:
+        """Fail closed before a production API or worker can initialize."""
+        if self.app_env.lower().strip() not in {"production", "prod"}:
+            return
+
+        errors: list[str] = []
+        database = self.database_url.strip()
+        parsed = urlsplit("")
+        database_hostname = ""
+        database_username = ""
+        try:
+            parsed = urlsplit(database.replace("+asyncpg", "", 1))
+            database_password = unquote(parsed.password or "").strip()
+            database_name = (parsed.path or "").strip("/")
+            database_hostname = parsed.hostname or ""
+            database_username = parsed.username or ""
+        except ValueError:
+            database_password = ""
+            database_name = ""
+        if (
+            not database
+            or not database_hostname
+            or not database_username
+            or not database_password
+            or not database_name
+            or database_password == DEFAULT_DATABASE_PASSWORD
+        ):
+            errors.append("DATABASE_URL must contain injected production database credentials")
+        if (
+            not self.session_secret.strip()
+            or self.session_secret.strip() == DEFAULT_SESSION_SECRET
+            or len(self.session_secret) < 32
+        ):
+            errors.append("SESSION_SECRET must be a unique production secret of at least 32 characters")
+        if self.cookie_secure is False:
+            errors.append("COOKIE_SECURE cannot be false in production")
+        if errors:
+            raise ValueError("Invalid production security configuration: " + "; ".join(errors))
 
     @cached_property
     def cors_origin_list(self) -> list[str]:

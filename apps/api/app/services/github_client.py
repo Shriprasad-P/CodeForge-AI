@@ -138,6 +138,41 @@ class GitHubClient:
             headers=_headers(app_jwt, token_type="Bearer"),
         )
 
+    async def get_user_installation(self, installation_id: int, user_token: str) -> dict[str, Any]:
+        """Find an installation the linked user can explicitly access.
+
+        GitHub exposes this authorization view through the paginated
+        ``/user/installations`` endpoint. The returned wrapper is retained so
+        the caller can compare the installation account with the App JWT view.
+        """
+        settings = get_settings()
+        page = 1
+        while True:
+            payload = await self._request(
+                "GET",
+                f"{settings.github_api_base_url}/user/installations",
+                headers=_headers(user_token, token_type="Bearer"),
+                params={"page": page, "per_page": 100},
+            )
+            installations = payload.get("installations") or []
+            for installation in installations:
+                if int(installation.get("id") or 0) == installation_id:
+                    return {"installation": installation}
+            total_count = int(payload.get("total_count") or len(installations))
+            if page * 100 >= total_count or not installations:
+                break
+            page += 1
+        raise GitHubAPIError("GitHub installation is not authorized", status_code=404)
+
+    async def get_organization_membership(self, organization: str, user_token: str) -> dict[str, Any]:
+        """Return the linked user's organization membership and role."""
+        settings = get_settings()
+        return await self._request(
+            "GET",
+            f"{settings.github_api_base_url}/user/memberships/orgs/{organization}",
+            headers=_headers(user_token, token_type="Bearer"),
+        )
+
     async def list_installation_repositories(
         self,
         installation_token: str,

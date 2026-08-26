@@ -1,0 +1,10 @@
+services:
+  # Host port publishing is intentionally isolated to this development-only
+  # override. The base Compose file keeps data services on the private network.
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+
+  redis:
+    ports:
+      - "${REDIS_PORT:-6380}:6379"

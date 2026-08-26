@@ -93,7 +93,7 @@ GitHub App variables are optional for boot. Add them when testing connect/instal
 ### 2. Infrastructure only
 
 ```bash
-docker compose up -d postgres redis
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis
 ```
 
 ### 3. API
@@ -135,7 +135,7 @@ Open [http://localhost:3000](http://localhost:3000) → Register / Login → Das
 
 ```bash
 cp .env.example .env
-docker compose up --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 - Web: http://localhost:3000

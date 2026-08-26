@@ -122,8 +122,15 @@ async def github_callback(
     except (GitHubAPIError, HTTPException):
         return RedirectResponse(url=f"{frontend}?error=oauth_failed", status_code=status.HTTP_302_FOUND)
 
-    # After linking, send user to install the app (state binds install claim).
-    install_state = await github_service.create_oauth_state(user.id, purpose="install")
+    # After linking, send user to install the app. The state is bound to the
+    # linked identity and temporarily carries the OAuth token needed to ask
+    # GitHub which installations that identity can administer.
+    install_state = await github_service.create_installation_setup_state(
+        user.id,
+        github_user_id=int(github_user["id"]),
+        github_login=str(github_user["login"]),
+        github_user_token=token,
+    )
     install_url = github_service.build_install_url(install_state)
     logger.info("github.oauth_linked", user_id=str(user.id), github_login=account.github_login)
     return RedirectResponse(url=install_url, status_code=status.HTTP_302_FOUND)
@@ -142,32 +149,64 @@ async def github_setup(
     if not installation_id:
         return RedirectResponse(url=f"{frontend}?error=missing_installation", status_code=status.HTTP_302_FOUND)
 
-    user_id: UUID | None = None
-    if state:
-        try:
-            state_data = await github_service.consume_oauth_state(state)
-            user_id = UUID(state_data["user_id"])
-        except HTTPException:
-            return RedirectResponse(url=f"{frontend}?error=invalid_state", status_code=status.HTTP_302_FOUND)
-
-    if user_id is None:
+    if not state:
         return RedirectResponse(url=f"{frontend}?error=unauthenticated_setup", status_code=status.HTTP_302_FOUND)
+    try:
+        state_data = await github_service.consume_installation_setup_state(state)
+        user_id = UUID(str(state_data["user_id"]))
+        github_user_id = int(state_data["github_user_id"])
+        github_user_token = str(state_data["github_user_token"])
+    except (HTTPException, ValueError, TypeError):
+        return RedirectResponse(url=f"{frontend}?error=invalid_state", status_code=status.HTTP_302_FOUND)
 
     user = await db.get(User, user_id)
-    if user is None:
+    if user is None or not user.is_active:
         return RedirectResponse(url=f"{frontend}?error=user_not_found", status_code=status.HTTP_302_FOUND)
 
-    account = await db.scalar(select(GitHubAccount).where(GitHubAccount.user_id == user.id))
+    account = await db.scalar(
+        select(GitHubAccount).where(
+            GitHubAccount.user_id == user.id,
+            GitHubAccount.github_user_id == github_user_id,
+        )
+    )
+    if account is None:
+        return RedirectResponse(url=f"{frontend}?error=identity_mismatch", status_code=status.HTTP_302_FOUND)
     client = GitHubClient()
     try:
+        authenticated_github_user = await client.get_authenticated_user(github_user_token)
         payload = await client.get_installation(installation_id)
+        user_installation = await client.get_user_installation(installation_id, github_user_token)
+        organization_membership = None
+        account_payload = payload.get("account") or {}
+        if str(account_payload.get("type") or "").lower() == "organization":
+            organization_membership = await client.get_organization_membership(
+                str(account_payload.get("login") or ""),
+                github_user_token,
+            )
+        github_service.verify_installation_authorization(
+            installation_id=installation_id,
+            installation_payload=payload,
+            user_installation_payload=user_installation,
+            authenticated_github_user=authenticated_github_user,
+            linked_github_user_id=account.github_user_id,
+            organization_membership_payload=organization_membership,
+        )
         await github_service.upsert_installation(
             db,
             user_id=user.id,
             installation_payload=payload,
             github_account_id=account.id if account else None,
         )
-    except (GitHubAPIError, HTTPException):
+    except GitHubAPIError:
+        # GitHub outages/rate limits should not strand the installation flow.
+        # Restore only this already-consumed state, preserving its original
+        # expiry; authorization failures remain permanently consumed.
+        try:
+            await github_service.restore_installation_setup_state(state, state_data)
+        except Exception:
+            logger.exception("github.installation_state_restore_failed")
+        return RedirectResponse(url=f"{frontend}?error=setup_failed", status_code=status.HTTP_302_FOUND)
+    except (HTTPException, ValueError, KeyError):
         return RedirectResponse(url=f"{frontend}?error=setup_failed", status_code=status.HTTP_302_FOUND)
 
     action = setup_action or "install"
