@@ -4,7 +4,7 @@
 
 AgentDock (the GitHub repository is [CodeForge-AI](https://github.com/Shriprasad-P/CodeForge-AI)) turns a focused coding task into an inspectable pull request. A worker gives a bounded agent a fresh Docker sandbox to inspect, edit, and validate a checkout. The browser receives live operational activity and a bounded diff preview. A human reviews the immutable artifact before a trusted service creates a branch, one commit, and one pull request.
 
-## What it does
+## How it works
 
 1. Connect a GitHub App installation and select a repository.
 2. Describe one bounded coding task.
@@ -108,6 +108,8 @@ The Stage 6 baseline verified 90 API tests, 54 worker tests with 1 Docker-gated 
 - Diff previews are bounded for browser safety; the complete immutable artifact remains server-side for publication.
 
 ## Documentation
+
+Comprehensive documentation is available in the `docs/` directory:
 
 - [Architecture](docs/architecture.md) · [Security](docs/security.md) · [Sandbox](docs/sandbox.md)
 - [GitHub App setup](docs/github-app.md) · [Publication](docs/publication.md) · [Realtime](docs/realtime.md)
